@@ -1,0 +1,28 @@
+[
+  {
+    "id": "bomb",
+    "key": "1",
+    "label": "Bomb"
+  },
+  {
+    "id": "love",
+    "key": "2",
+    "label": "Love"
+  },
+  {
+    "id": "shocking",
+    "key": "3",
+    "label": "Shocking",
+    "durationS": 5.5
+  },
+  {
+    "id": "yeah",
+    "key": "4",
+    "label": "Yeah"
+  },
+  {
+    "id": "bummer",
+    "key": "5",
+    "label": "Bummer"
+  }
+]

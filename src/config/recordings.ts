@@ -1,0 +1,60 @@
+import type { Recording } from '@/types/recording'
+
+export const recentRecordings: Recording[] = [
+  {
+    id: 'rec-1',
+    name: 'Product walkthrough — Q3 launch',
+    thumbnailUrl: 'https://picsum.photos/seed/recording-1/640/360',
+    recordedAt: '2026-07-11T14:32:00',
+    durationSeconds: 754,
+    status: 'published',
+  },
+  {
+    id: 'rec-2',
+    name: 'Weekly team sync recording',
+    thumbnailUrl: 'https://picsum.photos/seed/recording-2/640/360',
+    recordedAt: '2026-07-09T10:15:00',
+    durationSeconds: 2685,
+    status: 'draft',
+  },
+  {
+    id: 'rec-3',
+    name: 'Tutorial: Getting started with StreamStudio',
+    thumbnailUrl: 'https://picsum.photos/seed/recording-3/640/360',
+    recordedAt: '2026-07-07T18:48:00',
+    durationSeconds: 492,
+    status: 'published',
+  },
+  {
+    id: 'rec-4',
+    name: 'Client demo — Acme Corp',
+    thumbnailUrl: 'https://picsum.photos/seed/recording-4/640/360',
+    recordedAt: '2026-07-05T16:20:00',
+    durationSeconds: 1320,
+    status: 'draft',
+  },
+  {
+    id: 'rec-5',
+    name: 'Feature preview: new editor tools',
+    thumbnailUrl: 'https://picsum.photos/seed/recording-5/640/360',
+    recordedAt: '2026-07-03T11:05:00',
+    durationSeconds: 615,
+    status: 'published',
+  },
+  {
+    id: 'rec-6',
+    name: 'Onboarding session with design team',
+    thumbnailUrl: 'https://picsum.photos/seed/recording-6/640/360',
+    recordedAt: '2026-07-01T09:40:00',
+    durationSeconds: 1845,
+    status: 'draft',
+  },
+  {
+    id: 'rec-7',
+    name: 'Sprint review — June wrap-up',
+    thumbnailUrl: 'https://picsum.photos/seed/recording-7/640/360',
+    recordedAt: '2026-06-28T15:55:00',
+    durationSeconds: 2103,
+    status: 'published',
+  },
+]

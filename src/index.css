@@ -1,0 +1,63 @@
+@import 'tailwindcss';
+
+@theme {
+  --font-sans: 'Google Sans', sans-serif;
+}
+
+.google-sans {
+  font-family: 'Google Sans', sans-serif;
+  font-optical-sizing: auto;
+  font-weight: 400;
+  font-style: normal;
+  font-variation-settings: 'GRAD' 0;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: #ffffff;
+  color: #171717;
+  font-family: 'Google Sans', sans-serif;
+  font-optical-sizing: auto;
+  font-weight: 400;
+  font-style: normal;
+  font-variation-settings: 'GRAD' 0;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+#root {
+  width: 100%;
+  min-height: 100svh;
+  overflow: hidden;
+}
+
+button:not(:disabled),
+[role='button']:not([aria-disabled='true']),
+[role='menuitem']:not([aria-disabled='true']),
+[role='tab']:not([aria-disabled='true']),
+[role='option']:not([aria-disabled='true']),
+a[href],
+label[for],
+summary,
+select:not(:disabled),
+input[type='button']:not(:disabled),
+input[type='submit']:not(:disabled),
+input[type='reset']:not(:disabled),
+input[type='file']:not(:disabled),
+input[type='checkbox']:not(:disabled),
+input[type='radio']:not(:disabled) {
+  cursor: pointer;
+}
+
+button:disabled,
+[aria-disabled='true'],
+select:disabled,
+input:disabled {
+  cursor: not-allowed;
+}
