@@ -24,13 +24,14 @@ settings = get_settings()
 app = FastAPI(title=settings.app_name)
 storage = create_storage(settings)
 
-# Ensure localhost Vite origins are always allowed for OAuth + publish.
+# Ensure local Vite + production Netlify origins are always allowed.
 _cors_origins = list(
     dict.fromkeys(
         [
             *settings.cors_origin_list,
             "http://localhost:5173",
             "http://127.0.0.1:5173",
+            "https://streamstudioapp.netlify.app",
         ]
     )
 )
