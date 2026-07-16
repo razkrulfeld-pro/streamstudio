@@ -3,11 +3,11 @@ import { IntroOverlay, OutroOverlay, TransitionOverlay } from '@/components/edit
 import { InsertAudioPanel } from '@/components/editor/insert-audio-panel'
 import { PublishButton } from '@/components/PublishButton'
 import type { LibraryAssetView } from '@/context/asset-library-context'
-import { formatDuration } from '@/lib/format'
+import { parseAspectRatio } from '@/lib/recording-session-state'
 import { clampPlacement } from '@/lib/overlay-audio'
 import type { UploadResult } from '@/lib/types/youtube'
 import { cn } from '@/lib/utils'
-import type { YoutubeVisibility } from '@/types/settings'
+import type { SessionYouTubeMetadata } from '@/types/session'
 import {
   clampSourceToKept,
   EDITOR_TRANSITIONS,
@@ -26,6 +26,7 @@ import {
   type OverlayAudioClip,
 } from '@/types/editor-project'
 import {
+  ArrowLeft,
   AudioLines,
   Link2,
   Pause,
@@ -37,6 +38,7 @@ import {
 } from 'lucide-react'
 import { AnimatePresence, motion } from 'framer-motion'
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { Link } from 'react-router-dom'
 
 type EditorToolId = 'cut' | 'audio' | 'stickers' | 'text' | 'export'
 
@@ -58,11 +60,10 @@ interface EditorWorkspaceProps {
   recordingName: string
   onRecordingNameChange: (name: string) => void
   youtubeConnected: boolean
-  youtubeChannelName?: string
   youtubeHint: string
-  defaultDescription?: string
-  defaultPrivacy?: YoutubeVisibility
-  defaultCategoryId?: string
+  aspectRatio?: string
+  publishMetadata: SessionYouTubeMetadata
+  onPublishMetadataChange?: (metadata: SessionYouTubeMetadata) => void
   onSaveDraft: (project: EditorProject, options?: { overlayAudioBlob?: Blob | null }) => Promise<void>
   onPublish: (project: EditorProject, result: UploadResult) => Promise<void>
   initialProject?: EditorProject | null
@@ -82,11 +83,10 @@ export function EditorWorkspace({
   recordingName,
   onRecordingNameChange,
   youtubeConnected,
-  youtubeChannelName,
   youtubeHint,
-  defaultDescription = '',
-  defaultPrivacy = 'unlisted',
-  defaultCategoryId = '22',
+  aspectRatio = '16:9',
+  publishMetadata,
+  onPublishMetadataChange,
   onSaveDraft,
   onPublish,
   initialProject = null,
@@ -112,7 +112,6 @@ export function EditorWorkspace({
   const [activeTool, setActiveTool] = useState<EditorToolId | null>('cut')
   const [inBlackFrame, setInBlackFrame] = useState(false)
   const [isSaving, setIsSaving] = useState(false)
-  const [actionMessage, setActionMessage] = useState<string | null>(null)
   const [pendingAudioAtEditedS, setPendingAudioAtEditedS] = useState<number | null>(null)
   const [stageWidth, setStageWidth] = useState<number | null>(null)
   const pendingAudioAtEditedSRef = useRef<number | null>(null)
@@ -137,6 +136,10 @@ export function EditorWorkspace({
   )
 
   const editedDuration = useMemo(() => getEditedDuration(project), [project])
+  const videoAspect = useMemo(() => parseAspectRatio(aspectRatio), [aspectRatio])
+  const isPortraitPreview = videoAspect.width < videoAspect.height
+  /** Preview stage always matches Videos (16:9) so Shorts don't shrink the layout. */
+  const stageAspect = { width: 16, height: 9 }
 
   const introAssetUrl = imageAssets.find((asset) => asset.id === project.intro.assetId)?.previewUrl ?? null
   const outroAssetUrl = imageAssets.find((asset) => asset.id === project.outro.assetId)?.previewUrl ?? null
@@ -208,7 +211,6 @@ export function EditorWorkspace({
     setIsPlaying(false)
     setInBlackFrame(false)
     setActiveTool('cut')
-    setActionMessage(null)
     setPendingAudioAtEditedS(null)
     pendingAudioAtEditedSRef.current = null
     // Remount via key={recordingId}; only re-sync when the loaded media changes.
@@ -263,12 +265,8 @@ export function EditorWorkspace({
   const handleSaveDraft = async () => {
     if (isSaving) return
     setIsSaving(true)
-    setActionMessage(null)
     try {
       await onSaveDraft(project)
-      setActionMessage('Saved')
-    } catch (error) {
-      setActionMessage(error instanceof Error ? error.message : 'Failed to save.')
     } finally {
       setIsSaving(false)
     }
@@ -288,27 +286,13 @@ export function EditorWorkspace({
 
     const timer = window.setTimeout(() => {
       void onSaveDraft(project)
-        .then(() => setActionMessage('Auto-saved'))
-        .catch((error) => {
-          setActionMessage(error instanceof Error ? error.message : 'Auto-save failed.')
-        })
     }, 1600)
 
     return () => window.clearTimeout(timer)
   }, [project, onSaveDraft])
 
   const handlePublished = async (result: UploadResult) => {
-    setActionMessage(null)
-    try {
-      await onPublish(project, result)
-      setActionMessage(
-        youtubeChannelName
-          ? `Published to ${youtubeChannelName} — saved in lobby`
-          : 'Published to YouTube — saved in lobby',
-      )
-    } catch (error) {
-      setActionMessage(error instanceof Error ? error.message : 'Uploaded, but failed to save locally.')
-    }
+    await onPublish(project, result)
   }
   const seekEdited = useCallback(
     (nextTimeline: number) => {
@@ -750,9 +734,6 @@ export function EditorWorkspace({
       setProject((current) => ({ ...current, overlayAudio: nextClip }))
       pendingAudioAtEditedSRef.current = null
       setPendingAudioAtEditedS(null)
-      setActionMessage(
-        `Inserted audio starts at ${formatDuration(Math.floor(placed.startAtEditedS))} on the timeline.`,
-      )
     },
     [editedDuration, onOverlayAudioBlobChange],
   )
@@ -766,9 +747,6 @@ export function EditorWorkspace({
         if (!current.overlayAudio) {
           pendingAudioAtEditedSRef.current = at
           setPendingAudioAtEditedS(at)
-          setActionMessage(
-            `Audio cue set at ${formatDuration(Math.floor(at))} — extract or upload a clip to attach here.`,
-          )
           return current
         }
         const next = clampPlacement(
@@ -779,7 +757,6 @@ export function EditorWorkspace({
         )
         pendingAudioAtEditedSRef.current = null
         setPendingAudioAtEditedS(null)
-        setActionMessage(`Inserted audio now starts at ${formatDuration(Math.floor(next.startAtEditedS))}.`)
         return {
           ...current,
           overlayAudio: { ...current.overlayAudio, ...next },
@@ -829,62 +806,74 @@ export function EditorWorkspace({
         )}
       >
         <header
-          className="mx-auto flex w-full shrink-0 items-start justify-between gap-4"
+          className="mx-auto flex w-full shrink-0 flex-col gap-2"
           style={stageWidth != null ? { width: stageWidth, maxWidth: '100%' } : undefined}
         >
-          <div className="min-w-0 flex-1">
+          <Link
+            to="/"
+            className="inline-flex w-fit items-center gap-1.5 rounded-lg px-2 py-1 text-sm font-medium text-neutral-600 transition hover:bg-neutral-100 hover:text-neutral-900"
+          >
+            <ArrowLeft className="size-4" />
+            Back to Lobby
+          </Link>
+          <div className="flex w-full items-center justify-between gap-4">
             <input
               type="text"
               value={recordingName}
               onChange={(event) => onRecordingNameChange(event.target.value)}
-              className="w-full bg-transparent text-3xl font-semibold tracking-tight text-neutral-900 outline-none placeholder:text-neutral-400 md:text-4xl"
+              className="min-w-0 flex-1 bg-transparent text-3xl font-semibold tracking-tight text-neutral-900 outline-none placeholder:text-neutral-400 md:text-4xl"
               placeholder="Untitled recording"
               aria-label="Recording title"
             />
-            {actionMessage ? (
-              <p className="mt-2 text-sm text-neutral-600 md:text-base">{actionMessage}</p>
-            ) : null}
-          </div>
-          <div className="flex shrink-0 items-center gap-2 pt-1">
-            <button
-              type="button"
-              onClick={() => void handleSaveDraft()}
-              disabled={isSaving}
-              className="rounded-lg border border-neutral-200 bg-white px-4 py-2 text-sm font-medium text-neutral-800 transition hover:bg-neutral-50 disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              {isSaving ? 'Saving…' : 'Save'}
-            </button>
-            <PublishButton
-              videoBlob={videoBlob}
-              project={project}
-              overlayAudioBlob={overlayAudioBlob}
-              defaultTitle={recordingName.trim() || 'Untitled recording'}
-              defaultDescription={defaultDescription}
-              defaultPrivacy={defaultPrivacy}
-              defaultCategoryId={defaultCategoryId}
-              disabled={!youtubeConnected || isSaving}
-              disabledReason={
-                youtubeConnected ? youtubeHint : 'Connect YouTube in Settings before publishing.'
-              }
-              onPublished={handlePublished}
-            />
+            <div className="flex shrink-0 items-center gap-2">
+              <button
+                type="button"
+                onClick={() => void handleSaveDraft()}
+                disabled={isSaving}
+                className="rounded-lg border border-neutral-200 bg-white px-4 py-2 text-sm font-medium text-neutral-800 transition hover:bg-neutral-50 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {isSaving ? 'Saving…' : 'Save'}
+              </button>
+              <PublishButton
+                videoBlob={videoBlob}
+                project={project}
+                overlayAudioBlob={overlayAudioBlob}
+                publishMetadata={{ ...publishMetadata, title: recordingName.trim() || publishMetadata.title }}
+                aspectRatio={aspectRatio}
+                disabled={!youtubeConnected || isSaving}
+                disabledReason={
+                  youtubeConnected ? youtubeHint : 'Connect YouTube in Settings before publishing.'
+                }
+                onPublishMetadataChange={onPublishMetadataChange}
+                onPublished={handlePublished}
+              />
+            </div>
           </div>
         </header>
 
-        {/* Preview + timeline share one 16:9 column so the progress bar matches the frame */}
+        {/* Stage is always 16:9 (same as Videos). Shorts letterbox inside with no frame chrome. */}
         <section className="relative mt-6 flex min-h-0 flex-1 flex-col overflow-hidden">
           <div className="flex min-h-0 flex-1 items-center justify-center px-12 [container-type:size]">
             <div
               ref={stageColumnRef}
               className="flex max-h-full min-h-0 flex-col"
-              style={{ width: 'min(100%, calc((100cqh - 5rem) * 16 / 9))' }}
+              style={{
+                width: `min(100%, calc((100cqh - 5rem) * ${stageAspect.width} / ${stageAspect.height}))`,
+              }}
             >
-              <div className="relative aspect-video w-full overflow-hidden rounded-2xl bg-black">
+              <div
+                className={cn(
+                  'relative w-full overflow-hidden',
+                  isPortraitPreview ? 'bg-transparent' : 'rounded-2xl bg-black',
+                )}
+                style={{ aspectRatio: `${stageAspect.width} / ${stageAspect.height}` }}
+              >
                 <video
                   ref={videoRef}
                   src={videoUrl}
                   className={cn(
-                    'absolute inset-0 size-full object-cover transition-opacity',
+                    'absolute inset-0 size-full transition-opacity',
+                    isPortraitPreview ? 'object-contain' : 'object-cover',
                     inBlackFrame && 'opacity-0',
                   )}
                   muted={!isPlaying}
@@ -981,7 +970,10 @@ export function EditorWorkspace({
             </div>
           </div>
 
-          <nav className="relative z-20 mt-3 flex w-full shrink-0 items-stretch justify-center gap-2 px-3 pb-3">
+          <nav
+            className="relative z-20 mt-3 flex w-full shrink-0 items-stretch justify-center gap-2 px-3 pb-3"
+            style={stageWidth != null ? { width: stageWidth, maxWidth: '100%', marginInline: 'auto' } : undefined}
+          >
             {TOOLS.map((tool) => (
               <button
                 key={tool.id}
@@ -1055,13 +1047,12 @@ export function EditorWorkspace({
                     videoBlob={videoBlob}
                     project={project}
                     overlayAudioBlob={overlayAudioBlob}
-                    recordingName={recordingName}
+                    publishMetadata={{ ...publishMetadata, title: recordingName.trim() || publishMetadata.title }}
+                    aspectRatio={aspectRatio}
                     youtubeConnected={youtubeConnected}
                     youtubeHint={youtubeHint}
-                    defaultDescription={defaultDescription}
-                    defaultPrivacy={defaultPrivacy}
-                    defaultCategoryId={defaultCategoryId}
                     disabled={isSaving}
+                    onPublishMetadataChange={onPublishMetadataChange}
                     onPublished={handlePublished}
                   />
                 ) : null}
@@ -1398,25 +1389,23 @@ function ExportPanel({
   videoBlob,
   project,
   overlayAudioBlob,
-  recordingName,
+  publishMetadata,
+  aspectRatio,
   youtubeConnected,
   youtubeHint,
-  defaultDescription,
-  defaultPrivacy,
-  defaultCategoryId,
   disabled,
+  onPublishMetadataChange,
   onPublished,
 }: {
   videoBlob: Blob | null
   project: EditorProject
   overlayAudioBlob: Blob | null
-  recordingName: string
+  publishMetadata: SessionYouTubeMetadata
+  aspectRatio: string
   youtubeConnected: boolean
   youtubeHint: string
-  defaultDescription: string
-  defaultPrivacy: YoutubeVisibility
-  defaultCategoryId: string
   disabled: boolean
+  onPublishMetadataChange?: (metadata: SessionYouTubeMetadata) => void
   onPublished: (result: UploadResult) => void | Promise<void>
 }) {
   return (
@@ -1430,14 +1419,13 @@ function ExportPanel({
         videoBlob={videoBlob}
         project={project}
         overlayAudioBlob={overlayAudioBlob}
-        defaultTitle={recordingName.trim() || 'Untitled recording'}
-        defaultDescription={defaultDescription}
-        defaultPrivacy={defaultPrivacy}
-        defaultCategoryId={defaultCategoryId}
+        publishMetadata={publishMetadata}
+        aspectRatio={aspectRatio}
         disabled={!youtubeConnected || disabled}
         disabledReason={
           youtubeConnected ? youtubeHint : 'Connect YouTube in Settings before publishing.'
         }
+        onPublishMetadataChange={onPublishMetadataChange}
         className="w-full bg-[#5234d2] text-xs font-semibold hover:bg-[#4529b8]"
         onPublished={onPublished}
       />
