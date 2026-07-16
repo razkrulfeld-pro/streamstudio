@@ -3,22 +3,10 @@ import { useSettings } from '@/context/settings-context'
 import { getAuthStatus, getAuthUrl, getChannelInfo, logout } from '@/lib/api'
 import type { ChannelInfo } from '@/lib/types/youtube'
 import { cn } from '@/lib/utils'
+import { categoryOptions, visibilityOptions } from '@/lib/youtube-upload-options'
 import type { YoutubeVisibility } from '@/types/settings'
 import { CheckCircle2, Loader2, Video } from 'lucide-react'
 import { useCallback, useEffect, useState } from 'react'
-
-const visibilityOptions: { id: YoutubeVisibility; label: string }[] = [
-  { id: 'public', label: 'Public' },
-  { id: 'unlisted', label: 'Unlisted' },
-  { id: 'private', label: 'Private' },
-]
-
-const categoryOptions = [
-  { id: '22', label: 'People & Blogs' },
-  { id: '27', label: 'Education' },
-  { id: '28', label: 'Science & Technology' },
-  { id: '24', label: 'Entertainment' },
-]
 
 export function YoutubeSettingsSection() {
   const { settings, updateYoutube } = useSettings()
