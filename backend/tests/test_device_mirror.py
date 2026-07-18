@@ -79,6 +79,22 @@ def test_list_ready_adb_devices_parses_device_lines():
         ]
 
 
+def test_list_ready_adb_devices_filters_mdns_service_entries():
+    output = (
+        "List of devices attached\n"
+        "adb-R58M12345678-abc123._adb-tls-connect._tcp\tdevice\n"
+        "10.100.102.6:37487\tdevice\n"
+        "R58M12345678\tdevice\n"
+    )
+    with patch("app.device_mirror.subprocess.run") as run:
+        run.return_value.stdout = output
+        run.return_value.returncode = 0
+        assert list_ready_adb_devices("/opt/homebrew/bin/adb") == [
+            "10.100.102.6:37487",
+            "R58M12345678",
+        ]
+
+
 def test_list_ready_adb_devices_empty_when_none():
     with patch("app.device_mirror.subprocess.run") as run:
         run.return_value.stdout = "List of devices attached\n\n"
@@ -86,8 +102,18 @@ def test_list_ready_adb_devices_empty_when_none():
         assert list_ready_adb_devices("/opt/homebrew/bin/adb") == []
 
 
-def test_pick_adb_device_prefers_network_serial():
-    assert pick_adb_device(["R58M123", "192.168.1.50:37123", "emulator-5554"]) == "192.168.1.50:37123"
+def test_pick_adb_device_prefers_clean_host_port():
+    assert (
+        pick_adb_device(
+            [
+                "R58M123",
+                "adb-R58M123._adb-tls-connect._tcp",
+                "10.100.102.6:37487",
+                "emulator-5554",
+            ]
+        )
+        == "10.100.102.6:37487"
+    )
 
 
 def test_pick_adb_device_falls_back_to_first():
@@ -95,9 +121,11 @@ def test_pick_adb_device_falls_back_to_first():
     assert pick_adb_device([]) is None
 
 
-def test_scrcpy_cmd_is_headless_1080_8m():
-    cmd = build_scrcpy_cmd("/opt/homebrew/bin/scrcpy", "192.168.1.50:37123")
+def test_scrcpy_cmd_passes_explicit_serial_host_port():
+    cmd = build_scrcpy_cmd("/opt/homebrew/bin/scrcpy", "10.100.102.6:37487")
     assert cmd[0].endswith("scrcpy")
+    serial_idx = cmd.index("--serial")
+    assert cmd[serial_idx + 1] == "10.100.102.6:37487"
     assert "--no-playback" in cmd
     assert "--max-size=1080" in cmd
     assert any("8M" in a for a in cmd)

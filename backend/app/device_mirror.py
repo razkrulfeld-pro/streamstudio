@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 import subprocess
 import threading
@@ -10,6 +11,11 @@ from typing import Iterator, Literal, TypedDict
 logger = logging.getLogger(__name__)
 
 DeviceState = Literal["idle", "searching", "found", "connecting", "connected", "error"]
+
+# mDNS / Bonjour service discovery entries are not usable scrcpy serials.
+ADB_MDNS_MARKER = "._adb-tls-connect._tcp"
+# Prefer a plain IPv4 host:port serial from Wireless debugging.
+CLEAN_HOST_PORT_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}:\d+$")
 
 FRIENDLY_ERRORS = {
     "not_found": (
@@ -51,8 +57,16 @@ def resolve_tools() -> dict[str, str] | None:
     return paths
 
 
+def is_mdns_adb_serial(serial: str) -> bool:
+    return ADB_MDNS_MARKER in serial
+
+
+def is_clean_host_port_serial(serial: str) -> bool:
+    return bool(CLEAN_HOST_PORT_RE.match(serial))
+
+
 def list_ready_adb_devices(adb: str, timeout_s: float = 10.0) -> list[str]:
-    """Return serials currently listed as `device` by `adb devices`."""
+    """Return usable serials currently listed as `device` by `adb devices`."""
     try:
         result = subprocess.run(
             [adb, "devices"],
@@ -71,19 +85,27 @@ def list_ready_adb_devices(adb: str, timeout_s: float = 10.0) -> list[str]:
         if not line or line.startswith("List"):
             continue
         parts = line.split()
-        if len(parts) >= 2 and parts[1] == "device":
-            serials.append(parts[0])
+        if len(parts) < 2 or parts[1] != "device":
+            continue
+        serial = parts[0]
+        if is_mdns_adb_serial(serial):
+            continue
+        serials.append(serial)
     return serials
 
 
 def pick_adb_device(serials: list[str]) -> str | None:
-    """Prefer a network serial (host:port); otherwise the first ready device."""
-    if not serials:
+    """Prefer a clean host:port serial; otherwise the first usable device."""
+    usable = [s for s in serials if not is_mdns_adb_serial(s)]
+    if not usable:
         return None
-    for serial in serials:
+    for serial in usable:
+        if is_clean_host_port_serial(serial):
+            return serial
+    for serial in usable:
         if ":" in serial and not serial.startswith("emulator-"):
             return serial
-    return serials[0]
+    return usable[0]
 
 
 def build_scrcpy_cmd(scrcpy: str, serial: str, *, bit_rate_flag: str = "--video-bit-rate=8M") -> list[str]:
