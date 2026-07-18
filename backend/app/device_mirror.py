@@ -179,17 +179,15 @@ def _scrcpy_help_text(scrcpy: str) -> str:
         return ""
 
 
-def create_record_fifo() -> tuple[str, str]:
-    """Create a temp dir + named pipe for scrcpy ``--record=``.
+def create_record_file() -> tuple[str, str]:
+    """Create a temp dir + regular record path for scrcpy ``--record=``.
 
-    On macOS, ``--record=/dev/stdout`` does not reliably follow a Python
-    ``Popen(stdout=PIPE)`` redirect (and can mix server log lines into the
-    bitstream). A FIFO keeps Matroska bytes clean for ffmpeg.
+    A real file (not a FIFO) lets scrcpy open its window / Metal context and
+    append Matroska independently. ffmpeg then follows via ``tail -F``.
     """
     temp_dir = tempfile.mkdtemp(prefix="device-mirror-")
-    fifo_path = os.path.join(temp_dir, "record.mkv")
-    os.mkfifo(fifo_path)
-    return fifo_path, temp_dir
+    record_path = os.path.join(temp_dir, "record.mkv")
+    return record_path, temp_dir
 
 
 def build_scrcpy_cmd(
@@ -201,10 +199,11 @@ def build_scrcpy_cmd(
     video_source_flags: list[str] | None = None,
     record_path: str,
 ) -> list[str]:
-    """Build scrcpy argv that records Matroska into ``record_path`` (FIFO).
+    """Build scrcpy argv that records Matroska into ``record_path`` (regular file).
 
     Never use ``--record=-``: scrcpy 4.x treats that as a file named ``-``.
-    Prefer a named pipe over ``/dev/stdout`` on macOS.
+    Never use a FIFO here: under uvicorn a named pipe can stall Metal init;
+    record to a file and let ``tail -F`` feed ffmpeg instead.
     """
     headless = headless_flags if headless_flags is not None else resolve_scrcpy_headless_flags(scrcpy)
     video_source = (
@@ -226,8 +225,16 @@ def build_scrcpy_cmd(
     ]
 
 
-def build_ffmpeg_cmd(ffmpeg: str, input_path: str) -> list[str]:
-    """Remux live Matroska from a FIFO into fragmented MP4 on stdout.
+def build_tail_cmd(record_path: str) -> list[str]:
+    """Follow a growing scrcpy record file from byte 0 (macOS ``tail -F``)."""
+    return ["tail", "-c", "+0", "-F", record_path]
+
+
+def build_ffmpeg_cmd(ffmpeg: str) -> list[str]:
+    """Remux live Matroska from stdin (tailed file) into fragmented MP4 on stdout.
+
+    Input must be ``pipe:0`` fed by ``tail -F``: opening a growing ``.mkv``
+    directly with ``ffmpeg -i file`` hits premature EOF between scrcpy flushes.
 
     ``frag_every_frame`` + ``max_interleave_delta=0`` are required so ffmpeg
     flushes media fragments while the input is still open (plain
@@ -238,10 +245,12 @@ def build_ffmpeg_cmd(ffmpeg: str, input_path: str) -> list[str]:
         "-hide_banner",
         "-loglevel",
         "warning",
+        "-fflags",
+        "+genpts",
         "-f",
         "matroska",
         "-i",
-        input_path,
+        "pipe:0",
         "-c",
         "copy",
         "-f",
@@ -300,14 +309,22 @@ class Fmp4Broadcast:
     ffmpeg stdout is a single consumer pipe. Browsers (and Vite/devtools) often
     open ``/api/device/stream`` more than once; without replaying ``ftyp+moov``,
     the second connection gets mid-stream ``moof`` bytes and cannot decode.
+
+    Until the first subscriber attaches, post-init media is held in a bounded
+    preroll buffer so ``connected`` can wait for real fragments without dropping
+    the burst that proved the pipeline is live.
     """
 
     _QUEUE_SIZE = 64
+    _MAX_PREROLL_BYTES = 2_000_000
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._buffer = b""
         self._init: bytes | None = None
+        self._media_seen = False
+        self._preroll: list[bytes] = []
+        self._preroll_bytes = 0
         self._subscribers: list[queue.Queue[bytes | None]] = []
         self._closed = False
 
@@ -315,6 +332,11 @@ class Fmp4Broadcast:
     def init_segment(self) -> bytes | None:
         with self._lock:
             return self._init
+
+    @property
+    def media_seen(self) -> bool:
+        with self._lock:
+            return self._media_seen
 
     def feed(self, data: bytes) -> None:
         if not data:
@@ -332,6 +354,14 @@ class Fmp4Broadcast:
                 data = rest
                 if not data:
                     return
+            self._media_seen = True
+            if not self._subscribers:
+                self._preroll.append(data)
+                self._preroll_bytes += len(data)
+                while self._preroll_bytes > self._MAX_PREROLL_BYTES and self._preroll:
+                    dropped = self._preroll.pop(0)
+                    self._preroll_bytes -= len(dropped)
+                return
             dead: list[queue.Queue[bytes | None]] = []
             for q in self._subscribers:
                 try:
@@ -346,6 +376,8 @@ class Fmp4Broadcast:
             self._closed = True
             subs = list(self._subscribers)
             self._subscribers.clear()
+            self._preroll.clear()
+            self._preroll_bytes = 0
         for q in subs:
             try:
                 q.put_nowait(None)
@@ -358,11 +390,16 @@ class Fmp4Broadcast:
             if self._closed:
                 return
             init = self._init
+            preroll = list(self._preroll)
+            self._preroll.clear()
+            self._preroll_bytes = 0
             self._subscribers.append(q)
 
         try:
             if init:
                 yield init
+            for chunk in preroll:
+                yield chunk
             while True:
                 item = q.get()
                 if item is None:
@@ -403,11 +440,12 @@ class DeviceMirrorSession:
         self._error: str | None = None
         self._tools: dict[str, str] | None = None
         self._scrcpy_proc: subprocess.Popen[bytes] | None = None
+        self._tail_proc: subprocess.Popen[bytes] | None = None
         self._ffmpeg_proc: subprocess.Popen[bytes] | None = None
         self._broadcast: Fmp4Broadcast | None = None
         self._pump_thread: threading.Thread | None = None
-        self._fifo_path: str | None = None
-        self._fifo_dir: str | None = None
+        self._record_path: str | None = None
+        self._record_dir: str | None = None
         self._stopping = False
         self._connect_thread: threading.Thread | None = None
         self._watcher_thread: threading.Thread | None = None
@@ -507,47 +545,26 @@ class DeviceMirrorSession:
             return
 
         try:
-            fifo_path, fifo_dir = create_record_fifo()
+            record_path, record_dir = create_record_file()
         except OSError as exc:
-            logger.warning("Failed to create record FIFO: %s", exc)
+            logger.warning("Failed to create record path: %s", exc)
             self.set_error("connect_failed")
             return
 
-        scrcpy_cmd = build_scrcpy_cmd(tools["scrcpy"], address, record_path=fifo_path)
-        ffmpeg_cmd = build_ffmpeg_cmd(tools["ffmpeg"], fifo_path)
+        scrcpy_cmd = build_scrcpy_cmd(tools["scrcpy"], address, record_path=record_path)
+        tail_cmd = build_tail_cmd(record_path)
+        ffmpeg_cmd = build_ffmpeg_cmd(tools["ffmpeg"])
         logger.info(
-            "Starting mirror pipeline via FIFO %s: %s | %s",
-            fifo_path,
+            "Starting mirror pipeline via file-tail %s: %s | %s | %s",
+            record_path,
             " ".join(scrcpy_cmd),
+            " ".join(tail_cmd),
             " ".join(ffmpeg_cmd),
         )
 
-        # FIFO handshake: start ffmpeg first so it blocks in open(O_RDONLY) on the
-        # named pipe; only then start scrcpy, which opens O_WRONLY and unblocks both.
-        try:
-            ffmpeg_proc = subprocess.Popen(
-                ffmpeg_cmd,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-        except OSError as exc:
-            logger.warning("Failed to start ffmpeg: %s", exc)
-            self._cleanup_fifo(fifo_path, fifo_dir)
-            self.set_error("connect_failed")
-            return
-
-        _spawn_stderr_logger(ffmpeg_proc, "ffmpeg")
-
-        if not self._wait_for_ffmpeg_reader(ffmpeg_proc, timeout_s=3.0):
-            logger.warning("ffmpeg exited before opening the record FIFO")
-            self._kill_procs(None, ffmpeg_proc)
-            self._cleanup_fifo(fifo_path, fifo_dir)
-            self.set_error("connect_failed")
-            return
-
-        logger.info("ffmpeg is waiting on FIFO; starting scrcpy writer")
-
+        # File-tail handshake: start scrcpy first so it owns a real window/Metal
+        # context and appends Matroska to disk. Once the file has bytes, start
+        # tail -F → ffmpeg so the demuxer never sees premature EOF between flushes.
         try:
             scrcpy_proc = subprocess.Popen(
                 scrcpy_cmd,
@@ -560,7 +577,7 @@ class DeviceMirrorSession:
                 tools["scrcpy"],
                 address,
                 bit_rate_flag="--bit-rate=8M",
-                record_path=fifo_path,
+                record_path=record_path,
             )
             try:
                 scrcpy_proc = subprocess.Popen(
@@ -571,25 +588,67 @@ class DeviceMirrorSession:
                 )
             except OSError as exc:
                 logger.warning("Failed to start scrcpy: %s", exc)
-                self._kill_procs(None, ffmpeg_proc)
-                self._cleanup_fifo(fifo_path, fifo_dir)
+                self._cleanup_record(record_path, record_dir)
                 self.set_error("connect_failed")
                 return
 
         _spawn_stderr_logger(scrcpy_proc, "scrcpy")
 
-        time.sleep(0.75)
+        if not self._wait_for_record_bytes(record_path, scrcpy_proc, timeout_s=15.0, min_bytes=64 * 1024):
+            logger.warning("Timed out waiting for scrcpy to write record file %s", record_path)
+            self._kill_procs(scrcpy_proc, None, None)
+            self._cleanup_record(record_path, record_dir)
+            self.set_error("connect_failed")
+            return
+
+        logger.info("scrcpy is writing %s; starting tail → ffmpeg", record_path)
+
+        try:
+            tail_proc = subprocess.Popen(
+                tail_cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError as exc:
+            logger.warning("Failed to start tail: %s", exc)
+            self._kill_procs(scrcpy_proc, None, None)
+            self._cleanup_record(record_path, record_dir)
+            self.set_error("connect_failed")
+            return
+
+        try:
+            ffmpeg_proc = subprocess.Popen(
+                ffmpeg_cmd,
+                stdin=tail_proc.stdout,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except OSError as exc:
+            logger.warning("Failed to start ffmpeg: %s", exc)
+            self._kill_procs(scrcpy_proc, tail_proc, None)
+            self._cleanup_record(record_path, record_dir)
+            self.set_error("connect_failed")
+            return
+
+        # Allow tail to receive SIGPIPE if ffmpeg exits.
+        if tail_proc.stdout is not None:
+            tail_proc.stdout.close()
+
+        _spawn_stderr_logger(ffmpeg_proc, "ffmpeg")
+
+        time.sleep(0.35)
         if scrcpy_proc.poll() is not None:
             logger.warning("scrcpy exited early (rc=%s); see scrcpy stderr logs above", scrcpy_proc.returncode)
-            self._kill_procs(scrcpy_proc, ffmpeg_proc)
-            self._cleanup_fifo(fifo_path, fifo_dir)
+            self._kill_procs(scrcpy_proc, tail_proc, ffmpeg_proc)
+            self._cleanup_record(record_path, record_dir)
             self.set_error("connect_failed")
             return
 
         if ffmpeg_proc.poll() is not None:
             logger.warning("ffmpeg exited early (rc=%s); see ffmpeg stderr logs above", ffmpeg_proc.returncode)
-            self._kill_procs(scrcpy_proc, ffmpeg_proc)
-            self._cleanup_fifo(fifo_path, fifo_dir)
+            self._kill_procs(scrcpy_proc, tail_proc, ffmpeg_proc)
+            self._cleanup_record(record_path, record_dir)
             self.set_error("connect_failed")
             return
 
@@ -602,21 +661,22 @@ class DeviceMirrorSession:
         )
         pump.start()
 
-        if not self._wait_for_init_segment(broadcast, timeout_s=8.0):
-            logger.warning("Timed out waiting for fMP4 init segment from ffmpeg")
+        if not self._wait_for_media_fragment(broadcast, timeout_s=20.0):
+            logger.warning("Timed out waiting for live fMP4 media fragments from ffmpeg")
             broadcast.close()
-            self._kill_procs(scrcpy_proc, ffmpeg_proc)
-            self._cleanup_fifo(fifo_path, fifo_dir)
+            self._kill_procs(scrcpy_proc, tail_proc, ffmpeg_proc)
+            self._cleanup_record(record_path, record_dir)
             self.set_error("connect_failed")
             return
 
         with self._lock:
             self._scrcpy_proc = scrcpy_proc
+            self._tail_proc = tail_proc
             self._ffmpeg_proc = ffmpeg_proc
             self._broadcast = broadcast
             self._pump_thread = pump
-            self._fifo_path = fifo_path
-            self._fifo_dir = fifo_dir
+            self._record_path = record_path
+            self._record_dir = record_dir
 
         self._set_state("connected", device_address=address, message=None)
         watcher = threading.Thread(target=self._watch_procs, name="device-mirror-watch", daemon=True)
@@ -624,17 +684,28 @@ class DeviceMirrorSession:
         watcher.start()
 
     @staticmethod
-    def _wait_for_ffmpeg_reader(ffmpeg_proc: subprocess.Popen[bytes], timeout_s: float) -> bool:
-        """Ensure ffmpeg stayed alive long enough to reach blocking FIFO open."""
+    def _wait_for_record_bytes(
+        record_path: str,
+        scrcpy_proc: subprocess.Popen[bytes],
+        *,
+        timeout_s: float,
+        min_bytes: int,
+    ) -> bool:
+        """Wait until scrcpy has created and written at least ``min_bytes``."""
         deadline = time.monotonic() + timeout_s
-        settled_at = time.monotonic() + 0.15
         while time.monotonic() < deadline:
-            if ffmpeg_proc.poll() is not None:
+            if scrcpy_proc.poll() is not None:
                 return False
-            if time.monotonic() >= settled_at:
-                return True
-            time.sleep(0.05)
-        return ffmpeg_proc.poll() is None
+            try:
+                if os.path.exists(record_path) and os.path.getsize(record_path) >= min_bytes:
+                    return True
+            except OSError:
+                pass
+            time.sleep(0.1)
+        try:
+            return os.path.exists(record_path) and os.path.getsize(record_path) >= min_bytes
+        except OSError:
+            return False
 
     @staticmethod
     def _wait_for_init_segment(broadcast: Fmp4Broadcast, timeout_s: float) -> bool:
@@ -644,6 +715,21 @@ class DeviceMirrorSession:
                 return True
             time.sleep(0.05)
         return broadcast.init_segment is not None
+
+    @staticmethod
+    def _wait_for_media_fragment(broadcast: Fmp4Broadcast, timeout_s: float) -> bool:
+        """Wait until ffmpeg has emitted at least one post-init media chunk.
+
+        scrcpy flushes the record file in large bursts; init (ftyp+moov) often
+        arrives seconds before the first ``moof``. Marking connected too early
+        leaves the browser attached to an empty stream.
+        """
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if broadcast.media_seen:
+                return True
+            time.sleep(0.05)
+        return broadcast.media_seen
 
     @staticmethod
     def _pump_ffmpeg_stdout(
@@ -702,37 +788,40 @@ class DeviceMirrorSession:
     def _teardown_procs(self) -> None:
         with self._lock:
             scrcpy = self._scrcpy_proc
+            tail = self._tail_proc
             ffmpeg = self._ffmpeg_proc
             broadcast = self._broadcast
-            fifo_path = self._fifo_path
-            fifo_dir = self._fifo_dir
+            record_path = self._record_path
+            record_dir = self._record_dir
             self._scrcpy_proc = None
+            self._tail_proc = None
             self._ffmpeg_proc = None
             self._broadcast = None
             self._pump_thread = None
-            self._fifo_path = None
-            self._fifo_dir = None
+            self._record_path = None
+            self._record_dir = None
         if broadcast is not None:
             broadcast.close()
-        self._kill_procs(scrcpy, ffmpeg)
-        self._cleanup_fifo(fifo_path, fifo_dir)
+        self._kill_procs(scrcpy, tail, ffmpeg)
+        self._cleanup_record(record_path, record_dir)
 
     @staticmethod
-    def _cleanup_fifo(fifo_path: str | None, fifo_dir: str | None) -> None:
-        if fifo_path:
+    def _cleanup_record(record_path: str | None, record_dir: str | None) -> None:
+        if record_path:
             try:
-                os.unlink(fifo_path)
+                os.unlink(record_path)
             except OSError:
                 pass
-        if fifo_dir:
-            shutil.rmtree(fifo_dir, ignore_errors=True)
+        if record_dir:
+            shutil.rmtree(record_dir, ignore_errors=True)
 
     @staticmethod
     def _kill_procs(
         scrcpy: subprocess.Popen[bytes] | None,
+        tail: subprocess.Popen[bytes] | None,
         ffmpeg: subprocess.Popen[bytes] | None,
     ) -> None:
-        for proc in (ffmpeg, scrcpy):
+        for proc in (ffmpeg, tail, scrcpy):
             if proc is None:
                 continue
             try:

@@ -7,7 +7,8 @@ from app.device_mirror import (
     Fmp4Broadcast,
     build_ffmpeg_cmd,
     build_scrcpy_cmd,
-    create_record_fifo,
+    build_tail_cmd,
+    create_record_file,
     extract_fmp4_init_segment,
     list_ready_adb_devices,
     pick_adb_device,
@@ -168,22 +169,27 @@ def test_resolve_scrcpy_headless_flags_falls_back_to_no_window_without_positioni
         ]
 
 
-def test_create_record_fifo_makes_named_pipe():
+def test_create_record_file_makes_regular_file_not_fifo():
     import stat
 
-    fifo_path, temp_dir = create_record_fifo()
+    record_path, temp_dir = create_record_file()
     try:
-        assert os.path.exists(fifo_path)
         assert os.path.isdir(temp_dir)
-        assert fifo_path.startswith(temp_dir)
-        assert stat.S_ISFIFO(os.stat(fifo_path).st_mode)
+        assert record_path.startswith(temp_dir)
+        assert record_path.endswith("record.mkv")
+        # Path is reserved for scrcpy; file may be created empty or absent until start.
+        if os.path.exists(record_path):
+            mode = os.stat(record_path).st_mode
+            assert not stat.S_ISFIFO(mode)
+            assert stat.S_ISREG(mode)
     finally:
-        os.unlink(fifo_path)
+        if os.path.exists(record_path):
+            os.unlink(record_path)
         os.rmdir(temp_dir)
 
 
-def test_scrcpy_cmd_records_to_fifo_not_dev_stdout_or_dash():
-    fifo = "/tmp/device-mirror-test/record.mkv"
+def test_scrcpy_cmd_records_to_file_not_dev_stdout_or_dash():
+    record = "/tmp/device-mirror-test/record.mkv"
     cmd = build_scrcpy_cmd(
         "/opt/homebrew/bin/scrcpy",
         "10.100.102.6:37487",
@@ -193,7 +199,7 @@ def test_scrcpy_cmd_records_to_fifo_not_dev_stdout_or_dash():
             "--window-x=-10000",
             "--window-y=-10000",
         ],
-        record_path=fifo,
+        record_path=record,
         video_source_flags=["--video-source=display"],
     )
     assert cmd[0].endswith("scrcpy")
@@ -205,7 +211,7 @@ def test_scrcpy_cmd_records_to_fifo_not_dev_stdout_or_dash():
     assert "--window-x=-10000" in cmd
     assert "--window-y=-10000" in cmd
     assert "--video-source=display" in cmd
-    assert f"--record={fifo}" in cmd
+    assert f"--record={record}" in cmd
     assert "--record=/dev/stdout" not in cmd
     assert "--record=-" not in cmd
     assert not any(a.startswith("--record=mirror") for a in cmd)
@@ -231,14 +237,26 @@ def test_resolve_scrcpy_video_source_flags_empty_when_unsupported():
         assert resolve_scrcpy_video_source_flags("/opt/homebrew/bin/scrcpy") == []
 
 
-def test_ffmpeg_cmd_remuxes_fifo_to_live_fragmented_mp4_stdout():
-    fifo = "/tmp/device-mirror-test/record.mkv"
-    cmd = build_ffmpeg_cmd("/opt/homebrew/bin/ffmpeg", fifo)
+def test_tail_cmd_follows_record_file_from_start():
+    record = "/tmp/device-mirror-test/record.mkv"
+    cmd = build_tail_cmd(record)
+    assert cmd[0] == "tail"
+    assert "-c" in cmd or "+0" in cmd
+    assert "-F" in cmd
+    assert record in cmd
+
+
+def test_ffmpeg_cmd_remuxes_tailed_pipe_to_live_fragmented_mp4_stdout():
+    """ffmpeg reads matroska from stdin (fed by tail -F), not a direct file open.
+
+    Direct ``ffmpeg -i growing.mkv`` hits premature EOF; tail -F keeps the pipe open
+    as scrcpy appends.
+    """
+    cmd = build_ffmpeg_cmd("/opt/homebrew/bin/ffmpeg")
     joined = " ".join(cmd)
     assert "-f" in cmd
     assert "matroska" in cmd
-    assert fifo in cmd
-    assert "pipe:0" not in cmd
+    assert "pipe:0" in cmd
     assert "pipe:1" in cmd
     assert "frag_every_frame" in joined
     assert "empty_moov" in joined
@@ -303,3 +321,25 @@ def test_fmp4_broadcast_replays_init_segment_to_late_subscriber():
     assert next(second_gen) == moof2
     first_gen.close()
     second_gen.close()
+
+
+def test_fmp4_broadcast_prerolls_media_until_first_subscriber():
+    """Connected waits for media; that burst must not be dropped before /stream attaches."""
+    ftyp = _box(b"ftyp", b"iso5" + (0x200).to_bytes(4, "big") + b"iso5iso6mp41")
+    moov = _box(b"moov", b"\x00" * 64)
+    moof1 = _box(b"moof", b"\x01" * 16)
+    moof2 = _box(b"moof", b"\x02" * 16)
+
+    broadcast = Fmp4Broadcast()
+    assert broadcast.media_seen is False
+    broadcast.feed(ftyp + moov)
+    assert broadcast.media_seen is False
+    broadcast.feed(moof1)
+    assert broadcast.media_seen is True
+    broadcast.feed(moof2)
+
+    gen = broadcast.subscribe()
+    assert next(gen) == ftyp + moov
+    assert next(gen) == moof1
+    assert next(gen) == moof2
+    gen.close()
