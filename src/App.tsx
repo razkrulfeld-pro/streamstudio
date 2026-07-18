@@ -9,10 +9,12 @@ import { Navigate, Route, Routes } from 'react-router-dom'
 function App() {
   return (
     <Routes>
-      <Route path="record" element={<RecordingSessionPage />} />
+      <Route path="record" element={<Navigate to="/" replace />} />
+      <Route path="studio" element={<RecordingSessionPage />} />
       <Route path="auth/callback" element={<AuthCallbackPage />} />
       <Route element={<AppShell />}>
         <Route index element={<LobbyPage />} />
+        <Route path="new-session" element={<Navigate to="/" replace />} />
         <Route path="editor-studio" element={<EditorStudioPage />} />
         <Route path="settings" element={<SettingsPage />} />
         <Route path="*" element={<Navigate to="/" replace />} />

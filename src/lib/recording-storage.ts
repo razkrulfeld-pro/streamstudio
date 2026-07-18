@@ -2,6 +2,8 @@ import { isQuotaExceededError, OVERLAY_AUDIO_MAX_BYTES } from '@/lib/overlay-aud
 import type { EditorProject } from '@/types/editor-project'
 import { getEditedDuration, normalizeEditorProject } from '@/types/editor-project'
 import type { Recording, RecordingStatus } from '@/types/recording'
+import type { ContentTypeId } from '@/types/session'
+import type { SessionYouTubeMetadata } from '@/types/session'
 
 const DB_NAME = 'streamstudio-recordings'
 /** v2: optional `overlayAudioBlob` on recording records (no new object store). */
@@ -124,6 +126,9 @@ function toRecordingMetadata(recording: StoredRecording): Recording {
     recordedAt: recording.recordedAt,
     durationSeconds: displayDurationSeconds(recording),
     status: recording.status,
+    contentTypeId: recording.contentTypeId,
+    aspectRatio: recording.aspectRatio,
+    youtubeMetadata: recording.youtubeMetadata,
     thumbnailUrl: recording.thumbnailDataUrl,
     youtubeVideoId: recording.youtubeVideoId,
     youtubeVideoUrl: recording.youtubeVideoUrl,
@@ -180,6 +185,9 @@ export async function saveDraftRecording(input: {
   thumbnailBlob: Blob
   mimeType: string
   durationSeconds: number
+  contentTypeId?: ContentTypeId
+  aspectRatio?: string
+  youtubeMetadata?: SessionYouTubeMetadata
 }): Promise<Recording> {
   const thumbnailDataUrl = await blobToDataUrl(input.thumbnailBlob)
 
@@ -189,6 +197,9 @@ export async function saveDraftRecording(input: {
     recordedAt: new Date().toISOString(),
     durationSeconds: input.durationSeconds,
     status: 'draft' satisfies RecordingStatus,
+    contentTypeId: input.contentTypeId,
+    aspectRatio: input.aspectRatio,
+    youtubeMetadata: input.youtubeMetadata,
     thumbnailUrl: thumbnailDataUrl,
     videoBlob: input.videoBlob,
     thumbnailBlob: input.thumbnailBlob,
@@ -205,6 +216,7 @@ export type UpdateStoredRecordingPatch = {
   name?: string
   status?: RecordingStatus
   editorProject?: EditorProject
+  youtubeMetadata?: SessionYouTubeMetadata
   youtubeVideoId?: string
   youtubeVideoUrl?: string
   /**
@@ -232,6 +244,7 @@ export async function updateStoredRecording(
     name: patch.name ?? existing.name,
     status: patch.status ?? existing.status,
     editorProject: patch.editorProject ?? existing.editorProject,
+    youtubeMetadata: patch.youtubeMetadata ?? existing.youtubeMetadata,
     youtubeVideoId: patch.youtubeVideoId ?? existing.youtubeVideoId,
     youtubeVideoUrl: patch.youtubeVideoUrl ?? existing.youtubeVideoUrl,
   }
@@ -266,7 +279,10 @@ export async function createRecordingObjectUrls(
   }
 }
 
-export async function generateThumbnail(videoBlob: Blob): Promise<Blob> {
+export async function generateThumbnail(
+  videoBlob: Blob,
+  dimensions?: { width: number; height: number },
+): Promise<Blob> {
   const url = URL.createObjectURL(videoBlob)
 
   try {
@@ -287,8 +303,10 @@ export async function generateThumbnail(videoBlob: Blob): Promise<Blob> {
     })
 
     const canvas = document.createElement('canvas')
-    canvas.width = 640
-    canvas.height = 360
+    const thumbWidth = dimensions?.width ?? 640
+    const thumbHeight = dimensions?.height ?? 360
+    canvas.width = thumbWidth
+    canvas.height = thumbHeight
     const context = canvas.getContext('2d')
     if (!context) throw new Error('Failed to create thumbnail.')
 

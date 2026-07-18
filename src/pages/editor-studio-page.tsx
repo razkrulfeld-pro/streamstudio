@@ -4,6 +4,8 @@ import { useAssetLibrary } from '@/context/asset-library-context'
 import { useRecordings } from '@/context/recordings-context'
 import { useSettings } from '@/context/settings-context'
 import { getAuthStatus, getChannelInfo } from '@/lib/api'
+import { buildYouTubeMetadata } from '@/lib/recording-session-state'
+import { getSessionType } from '@/lib/sessionTypes'
 import type { UploadResult } from '@/lib/types/youtube'
 import {
   createRecordingObjectUrls,
@@ -11,6 +13,7 @@ import {
 } from '@/lib/recording-storage'
 import type { EditorProject } from '@/types/editor-project'
 import type { RecordingStatus } from '@/types/recording'
+import type { SessionYouTubeMetadata } from '@/types/session'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
 
@@ -35,6 +38,9 @@ export function EditorStudioPage() {
   const recordingId = searchParams.get('recording')
 
   const [recordingName, setRecordingName] = useState<string | null>(null)
+  const [aspectRatio, setAspectRatio] = useState('16:9')
+  const [contentTypeLabel, setContentTypeLabel] = useState<string | null>(null)
+  const [publishMetadata, setPublishMetadata] = useState<SessionYouTubeMetadata | null>(null)
   const [videoUrl, setVideoUrl] = useState<string | null>(null)
   const [videoBlob, setVideoBlob] = useState<Blob | null>(null)
   const [overlayAudioUrl, setOverlayAudioUrl] = useState<string | null>(null)
@@ -88,6 +94,7 @@ export function EditorStudioPage() {
       setInitialProject(null)
       setOverlayMissingMessage(null)
       setLoadError(null)
+      setPublishMetadata(null)
       return
     }
 
@@ -110,6 +117,7 @@ export function EditorStudioPage() {
           setOverlayAudioBlob(null)
           setDurationSeconds(null)
           setInitialProject(null)
+          setPublishMetadata(null)
           setLoadError('Draft recording not found.')
           setIsLoadingDraft(false)
           return
@@ -132,9 +140,17 @@ export function EditorStudioPage() {
           }
         }
 
+        const contentType = getSessionType(stored.contentTypeId)
+        const metadata =
+          stored.youtubeMetadata ??
+          buildYouTubeMetadata(contentType, settings.youtube, stored.name)
+
         objectUrlsRef.current = nextUrls
         setRecordingName(stored.name)
         setRecordingStatus(stored.status)
+        setAspectRatio(stored.aspectRatio ?? contentType.aspectRatio)
+        setContentTypeLabel(contentType.label)
+        setPublishMetadata({ ...metadata, title: stored.name })
         setVideoUrl(nextUrls.videoUrl)
         setVideoBlob(stored.videoBlob)
         setOverlayAudioUrl(nextUrls.overlayAudioUrl)
@@ -158,7 +174,7 @@ export function EditorStudioPage() {
     return () => {
       cancelled = true
     }
-  }, [recordingId])
+  }, [recordingId, settings.youtube])
 
   useEffect(() => {
     return () => {
@@ -171,6 +187,16 @@ export function EditorStudioPage() {
         objectUrlsRef.current = null
       }
     }
+  }, [])
+
+  const handleRecordingNameChange = useCallback((name: string) => {
+    setRecordingName(name)
+    setPublishMetadata((current) => (current ? { ...current, title: name } : current))
+  }, [])
+
+  const handlePublishMetadataChange = useCallback((metadata: SessionYouTubeMetadata) => {
+    setPublishMetadata(metadata)
+    setRecordingName(metadata.title)
   }, [])
 
   const handleOverlayAudioBlobChange = useCallback((blob: Blob | null) => {
@@ -206,6 +232,7 @@ export function EditorStudioPage() {
         name: string
         status: 'draft' | 'published'
         editorProject: EditorProject
+        youtubeMetadata?: SessionYouTubeMetadata
         overlayAudioBlob?: Blob | null
         youtubeVideoId?: string
         youtubeVideoUrl?: string
@@ -213,6 +240,7 @@ export function EditorStudioPage() {
         name: recordingName?.trim() || 'Untitled recording',
         status,
         editorProject: project,
+        youtubeMetadata: publishMetadata ?? undefined,
       }
       if (overlayBlobDirty) {
         patch.overlayAudioBlob = overlayAudioBlob
@@ -227,12 +255,11 @@ export function EditorStudioPage() {
       if (!result) throw new Error('Recording not found.')
       setOverlayBlobDirty(false)
     },
-    [overlayAudioBlob, overlayBlobDirty, recordingId, recordingName, updateRecording],
+    [overlayAudioBlob, overlayBlobDirty, publishMetadata, recordingId, recordingName, updateRecording],
   )
 
   const handleSaveDraft = useCallback(
     async (project: EditorProject) => {
-      // Preserve published status so re-saves / autosave don't demote a published video.
       await persistProject(project, recordingStatus)
     },
     [persistProject, recordingStatus],
@@ -243,7 +270,6 @@ export function EditorStudioPage() {
       if (!youtubeConnected) {
         throw new Error('Connect YouTube in Settings before publishing.')
       }
-      // Keep the full project + blob locally so publish stays in the lobby and reopenable.
       await persistProject(project, 'published', result)
       setRecordingStatus('published')
     },
@@ -255,7 +281,7 @@ export function EditorStudioPage() {
       return <p className="text-sm text-neutral-500">Loading draft recording…</p>
     }
 
-    if (!videoUrl || durationSeconds == null) {
+    if (!videoUrl || durationSeconds == null || !publishMetadata) {
       return (
         <div className="space-y-3">
           <p className="text-sm text-neutral-500">{loadError ?? 'Draft recording not found.'}</p>
@@ -265,6 +291,10 @@ export function EditorStudioPage() {
         </div>
       )
     }
+
+    const youtubeHint = youtubeConnected
+      ? `${contentTypeLabel ?? 'Video'} · ${aspectRatio} · uploads as ${visibilityLabels[publishMetadata.privacy].toLowerCase()}.`
+      : 'Connect YouTube in Settings before publishing.'
 
     return (
       <div className="-m-10 -mb-16 h-svh min-h-0 overflow-hidden md:-m-14 md:-mb-20 lg:-m-16 lg:-mb-24">
@@ -283,17 +313,13 @@ export function EditorStudioPage() {
           sourceDuration={Math.max(durationSeconds, 0.1)}
           assets={assets}
           recordingName={recordingName ?? ''}
-          onRecordingNameChange={setRecordingName}
+          onRecordingNameChange={handleRecordingNameChange}
           youtubeConnected={youtubeConnected}
-          youtubeChannelName={youtube.channelName}
-          youtubeHint={
-            youtubeConnected
-              ? `Ready for ${youtube.channelName || 'your channel'} as ${visibilityLabels[youtube.defaultVisibility].toLowerCase()}.`
-              : 'Connect YouTube in Settings before publishing.'
-          }
-          defaultDescription={youtube.defaultDescription}
-          defaultPrivacy={youtube.defaultVisibility}
-          defaultCategoryId={youtube.defaultCategory}
+          youtubeHint={youtubeHint}
+          aspectRatio={aspectRatio}
+          contentTypeLabel={contentTypeLabel ?? undefined}
+          publishMetadata={publishMetadata}
+          onPublishMetadataChange={handlePublishMetadataChange}
           initialProject={initialProject}
           onSaveDraft={handleSaveDraft}
           onPublish={handlePublish}
@@ -315,7 +341,7 @@ export function EditorStudioPage() {
           Finish a recording session or choose a draft from your lobby.
         </p>
         <Link
-          to="/record"
+          to="/"
           className="mt-4 inline-flex rounded-lg bg-neutral-900 px-4 py-2 text-sm font-medium text-white transition hover:bg-neutral-800"
         >
           Start a new recording

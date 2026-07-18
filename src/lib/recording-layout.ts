@@ -6,6 +6,7 @@ import type {
   ContainerStyle,
 } from '@/types/recording-layout'
 import { bubbleRatioValue, bubbleSizeScale } from '@/types/recording-layout'
+import { shouldDrawSegmentedPersonOnly } from '@/lib/export-cutout-helpers'
 
 export interface BubbleRect {
   x: number
@@ -95,20 +96,41 @@ export function drawContainSource(
   context.restore()
 }
 
+function computeContainContentRect(
+  frameRect: BubbleRect,
+  sourceWidth: number,
+  sourceHeight: number,
+): BubbleRect | null {
+  const layout = computeContainLayout(sourceWidth, sourceHeight, frameRect.width, frameRect.height)
+  if (!layout) return null
+
+  return {
+    x: frameRect.x + layout.offsetX,
+    y: frameRect.y + layout.offsetY,
+    width: layout.drawWidth,
+    height: layout.drawHeight,
+  }
+}
+
 export function drawScreenShareInFrame(
   context: CanvasRenderingContext2D,
   source: CanvasImageSource,
   frameRect: BubbleRect,
   cornerRadius: number,
 ) {
-  const radius = Math.max(0, Math.min(cornerRadius, Math.min(frameRect.width, frameRect.height) / 2))
+  const { width: sourceWidth, height: sourceHeight } = getSourceDimensions(source, frameRect)
+  const contentRect = computeContainContentRect(frameRect, sourceWidth, sourceHeight) ?? frameRect
+  const radius = Math.max(
+    0,
+    Math.min(cornerRadius, Math.min(contentRect.width, contentRect.height) / 2),
+  )
 
   context.save()
   context.beginPath()
-  context.roundRect(frameRect.x, frameRect.y, frameRect.width, frameRect.height, radius)
+  context.roundRect(contentRect.x, contentRect.y, contentRect.width, contentRect.height, radius)
   context.clip()
   // Fit the entire shared screen inside the container (no crop), centered.
-  drawContainSource(context, source, frameRect, false)
+  drawContainSource(context, source, contentRect, false)
   context.restore()
 }
 
@@ -389,13 +411,24 @@ export function drawVideoInStyledContainer(
     drawBackground(context, rect)
   }
 
-  if (segmentedPerson && getSourceDimensions(segmentedPerson, rect).width) {
-    drawCoverSource(context, segmentedPerson, rect, mirror, framing)
-  } else if (getSourceDimensions(source, rect).width) {
-    // Always draw the camera over any background when cutout isn't ready —
-    // otherwise the person disappears / looks frozen behind stage chrome.
+  const hasFreshSegmentedPerson = Boolean(
+    segmentedPerson && getSourceDimensions(segmentedPerson, rect).width,
+  )
+
+  if (
+    shouldDrawSegmentedPersonOnly({
+      hasBackground: Boolean(drawBackground),
+      hasFreshSegmentedPerson,
+    })
+  ) {
+    drawCoverSource(context, segmentedPerson!, rect, mirror, framing)
+  } else if (!drawBackground && getSourceDimensions(source, rect).width) {
+    // No cutout background — draw the full camera as usual.
     drawCoverSource(context, source, rect, mirror, framing)
   }
+  // When a cutout background is active but the mask isn't ready yet, keep the
+  // background only. Drawing the opaque camera here would bake a full-frame
+  // flash into Shorts and look like cutout "failed".
 
   context.restore()
 }

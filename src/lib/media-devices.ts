@@ -45,28 +45,45 @@ export function buildMediaConstraintAttempts(
   const { width, height } = resolutionDimensions[camera.resolution]
   const attempts: MediaStreamConstraints[] = []
 
+  const videoWithResolution = (
+    resolution: { width: number; height: number },
+  ): MediaTrackConstraints => ({
+    ...videoDeviceConstraint(cameraId),
+    width: { ideal: resolution.width, min: Math.min(640, resolution.width) },
+    height: { ideal: resolution.height, min: Math.min(480, resolution.height) },
+    frameRate: { ideal: 30, min: 24 },
+  })
+
   if (options.video !== false && options.audio !== false) {
+    // Prefer the configured resolution first, then step down so we still get HD when 4K fails.
     attempts.push({
-      video: {
-        ...videoDeviceConstraint(cameraId),
-        width: { ideal: width },
-        height: { ideal: height },
-      },
+      video: videoWithResolution({ width, height }),
       audio: audioDeviceConstraint(microphoneId) ?? true,
     })
-
+    if (camera.resolution === '4k') {
+      attempts.push({
+        video: videoWithResolution(resolutionDimensions['1080p']),
+        audio: audioDeviceConstraint(microphoneId) ?? true,
+      })
+    }
+    if (camera.resolution === '4k' || camera.resolution === '1080p') {
+      attempts.push({
+        video: videoWithResolution(resolutionDimensions['720p']),
+        audio: audioDeviceConstraint(microphoneId) ?? true,
+      })
+    }
     attempts.push({
       video: videoDeviceConstraint(cameraId) ?? true,
       audio: audioDeviceConstraint(microphoneId) ?? true,
     })
   } else if (options.video !== false) {
-    attempts.push({
-      video: {
-        ...videoDeviceConstraint(cameraId),
-        width: { ideal: width },
-        height: { ideal: height },
-      },
-    })
+    attempts.push({ video: videoWithResolution({ width, height }) })
+    if (camera.resolution === '4k') {
+      attempts.push({ video: videoWithResolution(resolutionDimensions['1080p']) })
+    }
+    if (camera.resolution === '4k' || camera.resolution === '1080p') {
+      attempts.push({ video: videoWithResolution(resolutionDimensions['720p']) })
+    }
     attempts.push({
       video: videoDeviceConstraint(cameraId) ?? true,
     })

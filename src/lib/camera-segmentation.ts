@@ -27,8 +27,9 @@ async function createSegmenter(delegate: 'GPU' | 'CPU'): Promise<ImageSegmenter>
 
   return ImageSegmenter.createFromOptions(vision, {
     baseOptions: {
+      // General selfie model — landscape-only variant degrades portrait Shorts masks.
       modelAssetPath:
-        'https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter_landscape/float16/latest/selfie_segmenter_landscape.tflite',
+        'https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite',
       delegate,
     },
     runningMode: 'VIDEO',
@@ -119,6 +120,18 @@ export function resetSegmentationSmoothing() {
   smoothedMaskData = null
   smoothedMaskWidth = 0
   smoothedMaskHeight = 0
+}
+
+/** Max age for a segmentation mask before we treat cutout as stale. */
+export const SEGMENTATION_MASK_STALE_MS = 250
+
+export function isSegmentationMaskFresh(
+  capturedAtMs: number | null,
+  nowMs: number,
+  staleAfterMs = SEGMENTATION_MASK_STALE_MS,
+): boolean {
+  if (capturedAtMs == null) return false
+  return nowMs - capturedAtMs <= staleAfterMs
 }
 
 export async function segmentCameraFrame(

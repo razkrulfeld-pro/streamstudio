@@ -1,7 +1,7 @@
 # Publish Dialog Redesign — Design
 
 **Date:** 2026-07-16  
-**Status:** Draft (awaiting user review)  
+**Status:** Approved  
 **Approach:** Single modal with Review → Uploading → Success (enhance `PublishButton`)
 
 ## Goal

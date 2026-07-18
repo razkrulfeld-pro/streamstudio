@@ -1,6 +1,7 @@
 import { getRecorderMimeType, getRecorderOptions } from '@/lib/recording-output'
+import { needsSourceSeek, resolveExportCanvasSize } from '@/lib/export-cutout-helpers'
 import {
-  buildTimelineSegments,
+  buildExportPlan,
   effectiveRecordingGain,
   getEditedDuration,
   type EditorProject,
@@ -8,6 +9,8 @@ import {
 } from '@/types/editor-project'
 
 type CanvasCaptureTrack = MediaStreamTrack & { requestFrame?: () => void }
+
+export { resolveExportCanvasSize } from '@/lib/export-cutout-helpers'
 
 function waitForEvent(target: EventTarget, event: string, timeoutMs = 15_000): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -45,6 +48,73 @@ async function seekMedia(media: HTMLMediaElement, time: number): Promise<void> {
   }
 }
 
+/** Wait until the video has a decoded frame near the seek target. */
+async function waitForDecodedFrame(
+  video: HTMLVideoElement,
+  targetTime: number,
+  timeoutMs = 8_000,
+): Promise<void> {
+  const deadline = performance.now() + timeoutMs
+
+  // Nudge decode by briefly playing if we are paused after a seek.
+  const wasPaused = video.paused
+  if (wasPaused) {
+    try {
+      await video.play()
+    } catch {
+      // ignore autoplay restrictions during export helpers
+    }
+  }
+
+  while (performance.now() < deadline) {
+    if (video.readyState >= 2 && Math.abs(video.currentTime - targetTime) < 0.35) {
+      if (wasPaused) video.pause()
+      return
+    }
+    await new Promise<void>((resolve) => {
+      window.setTimeout(resolve, 16)
+    })
+  }
+
+  if (wasPaused) video.pause()
+}
+
+function createExportClock(onTick: () => void): { start: () => void; stop: () => void } {
+  let worker: Worker | null = null
+  let stopped = true
+
+  return {
+    start() {
+      stopped = false
+      const workerSource = `
+        let id = 0;
+        self.onmessage = (event) => {
+          if (event.data === 'start') {
+            clearInterval(id);
+            id = setInterval(() => self.postMessage('tick'), 33);
+          } else if (event.data === 'stop') {
+            clearInterval(id);
+          }
+        };
+      `
+      const blob = new Blob([workerSource], { type: 'application/javascript' })
+      const url = URL.createObjectURL(blob)
+      worker = new Worker(url)
+      URL.revokeObjectURL(url)
+      worker.onmessage = () => {
+        if (!stopped) onTick()
+      }
+      worker.postMessage('start')
+    },
+    stop() {
+      stopped = true
+      worker?.postMessage('stop')
+      worker?.terminate()
+      worker = null
+    },
+  }
+}
+
 async function waitUntilSource(
   video: HTMLVideoElement,
   sourceEnd: number,
@@ -54,15 +124,15 @@ async function waitUntilSource(
     performance.now() + Math.max(2, sourceEnd - video.currentTime + 2) * 1000 + 8_000
 
   await new Promise<void>((resolve) => {
-    const tick = () => {
+    const check = () => {
       onTick?.(video.currentTime)
       if (video.currentTime >= sourceEnd - 0.035 || video.ended || performance.now() > deadline) {
         resolve()
         return
       }
-      requestAnimationFrame(tick)
+      window.setTimeout(check, 16)
     }
-    requestAnimationFrame(tick)
+    check()
   })
 }
 
@@ -154,14 +224,17 @@ function syncOverlayToEdited(
 export interface ExportEditedVideoOptions {
   overlayAudioBlob?: Blob | null
   onProgress?: (percent: number) => void
+  /** Session aspect (e.g. 9:16) used when the browser hasn't decoded video size yet. */
+  aspectRatio?: string
 }
 
 /**
  * Re-encode the recording so kept timeline segments are concatenated with hard cuts,
  * and optional overlay audio is mixed in at its edited-timeline start time.
  *
- * Uses MediaRecorder.pause/resume around seeks plus captureStream(0)+requestFrame so
- * cut gaps are never encoded as frozen frames.
+ * Cut-outs are applied by pausing the encoder while source playback continues through
+ * the removed range (no WebM seek across the gap). That prevents freeze frames and
+ * accidentally baking cut footage into the upload.
  */
 export async function exportEditedVideo(
   sourceBlob: Blob,
@@ -176,8 +249,8 @@ export async function exportEditedVideo(
   const onProgress = options.onProgress
   const overlayAudioBlob = options.overlayAudioBlob ?? null
 
-  const segments = buildTimelineSegments(project)
-  if (segments.length === 0) {
+  const plan = buildExportPlan(project)
+  if (plan.length === 0) {
     throw new Error('Nothing to export after cuts and trims.')
   }
 
@@ -191,9 +264,23 @@ export async function exportEditedVideo(
   let audioContext: AudioContext | null = null
   let overlayUrl: string | null = null
   let overlayAudio: HTMLAudioElement | null = null
+  const exportClockRef: { current: { start: () => void; stop: () => void } | null } = {
+    current: null,
+  }
 
   try {
     await waitForEvent(video, 'loadedmetadata')
+
+    // Some WebM Shorts report 0×0 until a frame is decoded.
+    if (!video.videoWidth || !video.videoHeight) {
+      try {
+        await video.play()
+        await waitForDecodedFrame(video, 0)
+        video.pause()
+      } catch {
+        // Fall through to aspect-ratio sized canvas.
+      }
+    }
 
     let sourceDuration = video.duration
     if (!Number.isFinite(sourceDuration) || sourceDuration === Infinity || sourceDuration <= 0) {
@@ -205,8 +292,11 @@ export async function exportEditedVideo(
       return sourceBlob
     }
 
-    const width = video.videoWidth || 1280
-    const height = video.videoHeight || 720
+    const { width, height } = resolveExportCanvasSize(
+      video.videoWidth,
+      video.videoHeight,
+      options.aspectRatio,
+    )
     const canvas = document.createElement('canvas')
     canvas.width = width
     canvas.height = height
@@ -243,8 +333,6 @@ export async function exportEditedVideo(
       overlayGain.connect(audioDestination)
     }
 
-    // Prefer manual frames (captureStream(0)+requestFrame) so idle/seek time isn't encoded.
-    // Fall back to 30fps capture when requestFrame is unavailable.
     const probeTrack = document.createElement('canvas').captureStream(0).getVideoTracks()[0] as
       | CanvasCaptureTrack
       | undefined
@@ -260,7 +348,10 @@ export async function exportEditedVideo(
 
     const mimeType = getRecorderMimeType()
     const chunks: Blob[] = []
-    const recorder = new MediaRecorder(combinedStream, getRecorderOptions(mimeType))
+    const recorder = new MediaRecorder(
+      combinedStream,
+      getRecorderOptions(mimeType, { width: canvas.width, height: canvas.height }),
+    )
     recorder.ondataavailable = (event) => {
       if (event.data.size > 0) chunks.push(event.data)
     }
@@ -276,8 +367,12 @@ export async function exportEditedVideo(
       }
     }
 
+    let paintMode: 'video' | 'black' | 'idle' = 'idle'
+
     const drawVideoFrame = () => {
-      ctx.drawImage(video, 0, 0, width, height)
+      if (video.readyState >= 2 && video.videoWidth > 0) {
+        ctx.drawImage(video, 0, 0, width, height)
+      }
       pushFrame()
     }
 
@@ -287,82 +382,130 @@ export async function exportEditedVideo(
       pushFrame()
     }
 
-    let drawing = false
-    let drawRaf = 0
-
-    const startDrawing = () => {
-      drawing = true
-      const tick = () => {
-        if (!drawing) return
-        drawVideoFrame()
-        drawRaf = requestAnimationFrame(tick)
-      }
-      drawRaf = requestAnimationFrame(tick)
+    const stopExportClock = () => {
+      exportClockRef.current?.stop()
+      exportClockRef.current = null
+      paintMode = 'idle'
     }
 
-    const stopDrawing = () => {
-      drawing = false
-      cancelAnimationFrame(drawRaf)
+    const startExportClock = (mode: 'video' | 'black') => {
+      stopExportClock()
+      paintMode = mode
+      // Worker clock (not RAF) so background-tab throttling cannot freeze encodes.
+      exportClockRef.current = createExportClock(() => {
+        if (paintMode === 'video') drawVideoFrame()
+        else if (paintMode === 'black') drawBlackFrame()
+      })
+      exportClockRef.current.start()
     }
 
     recorder.start(100)
-    // Stay paused until the first kept frame is ready so startup seek isn't encoded.
     await setRecorderPaused(recorder, true)
 
     const editedDuration = Math.max(0.001, getEditedDuration(project))
+    const firstSource =
+      plan.find((step) => step.kind === 'video' || step.kind === 'cut')?.sourceStart ??
+      project.trimStart
 
-    for (let index = 0; index < segments.length; index += 1) {
-      const segment = segments[index]!
+    if (needsSourceSeek(video.currentTime, firstSource)) {
+      video.pause()
+      await seekMedia(video, firstSource)
+      await waitForDecodedFrame(video, firstSource)
+    }
 
-      // Pause encoding while seeking so cut gaps are not baked as frozen frames.
-      await setRecorderPaused(recorder, true)
-      syncOverlayToEdited(overlayAudio, bakeOverlay ? clip : null, segment.timelineStart, false)
+    for (const step of plan) {
+      if (step.kind === 'video') {
+        await setRecorderPaused(recorder, true)
+        stopExportClock()
+        syncOverlayToEdited(overlayAudio, bakeOverlay ? clip : null, step.timelineStart, false)
 
-      if (segment.kind === 'video') {
-        video.pause()
-        await seekMedia(video, segment.sourceStart)
+        if (needsSourceSeek(video.currentTime, step.sourceStart)) {
+          video.pause()
+          await seekMedia(video, step.sourceStart)
+          await waitForDecodedFrame(video, step.sourceStart)
+        }
+
         drawVideoFrame()
-
         await setRecorderPaused(recorder, false)
-        startDrawing()
+        startExportClock('video')
+
         try {
           await video.play()
         } catch {
-          stopDrawing()
+          stopExportClock()
           throw new Error('Could not play source video during export.')
         }
 
-        await waitUntilSource(video, segment.sourceEnd, (sourceTime) => {
-          const timelinePos = segment.timelineStart + Math.max(0, sourceTime - segment.sourceStart)
+        await waitUntilSource(video, step.sourceEnd, (sourceTime) => {
+          const timelinePos = step.timelineStart + Math.max(0, sourceTime - step.sourceStart)
           syncOverlayToEdited(overlayAudio, bakeOverlay ? clip : null, timelinePos, true)
           onProgress?.(Math.min(99, (timelinePos / editedDuration) * 100))
         })
 
-        video.pause()
-        stopDrawing()
-        syncOverlayToEdited(overlayAudio, bakeOverlay ? clip : null, segment.timelineEnd, false)
-        // Stop encoding before any boundary work so seeks cannot bake freezes.
+        // Pause encoder before any cut/black/next seek so the last kept frame is not held.
         await setRecorderPaused(recorder, true)
-      } else {
-        await setRecorderPaused(recorder, false)
-        const startedAt = performance.now()
-        const durationMs = Math.max(50, segment.durationS * 1000)
+        stopExportClock()
+        syncOverlayToEdited(overlayAudio, bakeOverlay ? clip : null, step.timelineEnd, false)
+        continue
+      }
 
-        while (performance.now() - startedAt < durationMs) {
-          drawBlackFrame()
-          const elapsed = (performance.now() - startedAt) / 1000
-          const timelinePos = segment.timelineStart + elapsed
-          syncOverlayToEdited(overlayAudio, bakeOverlay ? clip : null, timelinePos, true)
-          onProgress?.(Math.min(99, (timelinePos / editedDuration) * 100))
-          await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+      if (step.kind === 'cut') {
+        // Critical: keep encoder paused and play through the removed range.
+        // Seeking across WebM cut gaps is what produced freezes + kept cut footage.
+        await setRecorderPaused(recorder, true)
+        stopExportClock()
+        recordingGain.gain.value = 0
+
+        if (needsSourceSeek(video.currentTime, step.sourceStart)) {
+          video.pause()
+          await seekMedia(video, step.sourceStart)
+          await waitForDecodedFrame(video, step.sourceStart)
         }
 
-        syncOverlayToEdited(overlayAudio, bakeOverlay ? clip : null, segment.timelineEnd, false)
-        await setRecorderPaused(recorder, true)
+        try {
+          await video.play()
+        } catch {
+          recordingGain.gain.value = effectiveRecordingGain(project)
+          throw new Error('Could not play source video while skipping a cut-out.')
+        }
+
+        await waitUntilSource(video, step.sourceEnd)
+        video.pause()
+        recordingGain.gain.value = effectiveRecordingGain(project)
+        continue
       }
+
+      // Black frame insert — encoder runs, source is held.
+      await setRecorderPaused(recorder, true)
+      stopExportClock()
+      video.pause()
+      syncOverlayToEdited(overlayAudio, bakeOverlay ? clip : null, step.timelineStart, false)
+
+      if (needsSourceSeek(video.currentTime, step.holdSourceTime)) {
+        await seekMedia(video, step.holdSourceTime)
+        await waitForDecodedFrame(video, step.holdSourceTime)
+      }
+
+      await setRecorderPaused(recorder, false)
+      const startedAt = performance.now()
+      const durationMs = Math.max(50, step.durationS * 1000)
+      startExportClock('black')
+
+      while (performance.now() - startedAt < durationMs) {
+        const elapsed = (performance.now() - startedAt) / 1000
+        const timelinePos = step.timelineStart + elapsed
+        syncOverlayToEdited(overlayAudio, bakeOverlay ? clip : null, timelinePos, true)
+        onProgress?.(Math.min(99, (timelinePos / editedDuration) * 100))
+        await new Promise<void>((resolve) => window.setTimeout(resolve, 16))
+      }
+
+      stopExportClock()
+      syncOverlayToEdited(overlayAudio, bakeOverlay ? clip : null, step.timelineEnd, false)
+      await setRecorderPaused(recorder, true)
     }
 
-    stopDrawing()
+    stopExportClock()
+    video.pause()
     if (overlayAudio && !overlayAudio.paused) overlayAudio.pause()
     if (recorder.state === 'paused') await setRecorderPaused(recorder, false)
     if (recorder.state !== 'inactive') recorder.stop()
@@ -374,6 +517,8 @@ export async function exportEditedVideo(
     onProgress?.(100)
     return blob
   } finally {
+    exportClockRef.current?.stop()
+    exportClockRef.current = null
     if (overlayAudio) {
       overlayAudio.pause()
       overlayAudio.removeAttribute('src')

@@ -1,3 +1,4 @@
+import { extractWaveformPeaks, slicePeaksForSourceRange } from '@/lib/audio-waveform'
 import { formatDuration } from '@/lib/format'
 import { cn } from '@/lib/utils'
 import {
@@ -13,13 +14,22 @@ import {
   type OverlayAudioClip,
 } from '@/types/editor-project'
 import { AudioLines, Plus, Scissors, Square, Trash2 } from 'lucide-react'
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+
+/** Half of the previous single-track height (`h-14` → `h-7`). */
+const LANE_HEIGHT_CLASS = 'h-7'
 
 interface CapCutTimelineProps {
   project: EditorProject
   sourceDuration: number
   timelineTime: number
   editedDuration: number
+  /** When true, hover shows the scrub line but does not seek/pause. */
+  isPlaying?: boolean
+  /** Preferred source for waveform decode. */
+  videoBlob?: Blob | null
+  /** Fallback media URL when blob is unavailable. */
+  videoUrl?: string | null
   onSeekTimeline: (timelineTime: number) => void
   /** Fast-forward preview while drafting a cut from start → current end. */
   onPreviewSource?: (cutStart: number, cutEnd: number) => void
@@ -31,6 +41,8 @@ interface CapCutTimelineProps {
   onRemoveCut: (id: string) => void
   onRemoveBlackFrame: (id: string) => void
   onDragChange?: (dragging: boolean) => void
+  /** Click (no drag) on the timeline — seek and play from that edited time. */
+  onPlayFromTimeline?: (editedTimeSeconds: number) => void
   /**
    * Place (or queue) inserted audio to start at this edited timeline time.
    * Fired from the + menu “Add audio” action.
@@ -66,6 +78,9 @@ export function CapCutTimeline({
   sourceDuration,
   timelineTime,
   editedDuration,
+  isPlaying = false,
+  videoBlob = null,
+  videoUrl = null,
   onSeekTimeline,
   onPreviewSource,
   onChangeTrim,
@@ -76,6 +91,7 @@ export function CapCutTimeline({
   onRemoveCut,
   onRemoveBlackFrame,
   onDragChange,
+  onPlayFromTimeline,
   onPlaceAudio,
   pendingAudioAtEditedS = null,
 }: CapCutTimelineProps) {
@@ -83,6 +99,11 @@ export function CapCutTimeline({
   const plusMenuRef = useRef<HTMLDivElement>(null)
   const projectRef = useRef(project)
   const cutDraftRef = useRef<{ start: number; end: number } | null>(null)
+  const playheadGestureRef = useRef<{
+    startX: number
+    moved: boolean
+    assembly: number
+  } | null>(null)
   const trimGestureRef = useRef<{
     edge: 'start' | 'end'
     startX: number
@@ -109,6 +130,7 @@ export function CapCutTimeline({
   } | null>(null)
   const cutSessionCleanupRef = useRef<(() => void) | null>(null)
   const sourceDurationRef = useRef(sourceDuration)
+  const isPlayingRef = useRef(isPlaying)
   const hoverScrubRafRef = useRef<number | null>(null)
   const hoverScrubbingRef = useRef(false)
   const [hoverLocalRatio, setHoverLocalRatio] = useState<number | null>(null)
@@ -122,10 +144,34 @@ export function CapCutTimeline({
     id: string
     edge: 'start' | 'end'
   } | null>(null)
+  const [waveformPeaks, setWaveformPeaks] = useState<number[] | null>(null)
 
   projectRef.current = project
   cutDraftRef.current = cutDraft
   sourceDurationRef.current = sourceDuration
+  isPlayingRef.current = isPlaying
+
+  useEffect(() => {
+    let cancelled = false
+    const source = videoBlob ?? videoUrl
+    if (!source) {
+      setWaveformPeaks(null)
+      return
+    }
+
+    setWaveformPeaks(null)
+    void extractWaveformPeaks(source)
+      .then((peaks) => {
+        if (!cancelled) setWaveformPeaks(peaks)
+      })
+      .catch(() => {
+        if (!cancelled) setWaveformPeaks(null)
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [videoBlob, videoUrl])
 
   useEffect(
     () => () => {
@@ -248,9 +294,19 @@ export function CapCutTimeline({
     }
   }, [onDragChange])
 
+  useEffect(() => {
+    if (isPlaying) stopHoverScrub()
+  }, [isPlaying, stopHoverScrub])
+
   /** Live-render the frame under the hover/plus line (skips cuts + black frames). */
   const previewHoverAssembly = useCallback(
     (assemblyTime: number) => {
+      // Playing: keep the scrub line UI, but never seek/pause from hover alone.
+      if (isPlayingRef.current) {
+        stopHoverScrub()
+        return
+      }
+
       const overCutOrFrame = piecesRef.current.some(
         (piece) =>
           piece.kind !== 'video' &&
@@ -447,6 +503,18 @@ export function CapCutTimeline({
     [onDragChange, onPreviewSource, stopHoverScrub],
   )
 
+  const beginPlayheadGesture = useCallback(
+    (clientX: number) => {
+      stopHoverScrub()
+      const assembly = assemblyFromClientX(clientX)
+      playheadGestureRef.current = { startX: clientX, moved: false, assembly }
+      seekFromAssembly(assembly)
+      setDragMode('playhead')
+      // Delay onDragChange until the pointer actually moves — a click should play, not pause.
+    },
+    [assemblyFromClientX, seekFromAssembly, stopHoverScrub],
+  )
+
   useEffect(() => {
     // Cut sessions attach their own listeners in beginCutGesture.
     if (!dragMode || dragMode === 'cutEnd') return
@@ -456,7 +524,16 @@ export function CapCutTimeline({
 
     const onMove = (event: PointerEvent) => {
       if (mode === 'playhead') {
-        seekFromAssembly(assemblyFromClientX(event.clientX))
+        const gesture = playheadGestureRef.current
+        const assembly = assemblyFromClientX(event.clientX)
+        if (gesture) {
+          if (!gesture.moved && Math.abs(event.clientX - gesture.startX) > TRIM_CLICK_SLOP_PX) {
+            gesture.moved = true
+            onDragChange?.(true)
+          }
+          gesture.assembly = assembly
+        }
+        seekFromAssembly(assembly)
         return
       }
 
@@ -563,6 +640,18 @@ export function CapCutTimeline({
         seekFromAssembly(mode === 'trimStart' ? 0 : spanRef.current)
       }
 
+      if (mode === 'playhead') {
+        const gesture = playheadGestureRef.current
+        playheadGestureRef.current = null
+        setDragMode(null)
+        if (gesture && !gesture.moved) {
+          onPlayFromTimeline?.(assemblyToEdited(projectRef.current, gesture.assembly))
+        } else {
+          onDragChange?.(false)
+        }
+        return
+      }
+
       trimGestureRef.current = null
       pieceEdgeGestureRef.current = null
       setActivePieceEdge(null)
@@ -586,6 +675,7 @@ export function CapCutTimeline({
     onChangeTrim,
     onPreviewSource,
     onDragChange,
+    onPlayFromTimeline,
     onUpdateCut,
     onUpdateBlackFrame,
   ])
@@ -642,20 +732,21 @@ export function CapCutTimeline({
     }
   }, [assemblyToTrackPct, cutDraft, pieces, project, timelineTime])
 
+  const showInsertedAudioLane = project.overlayAudio != null || pendingAudioAtEditedS != null
+  const resizeCursor =
+    dragMode === 'trimStart' ||
+    dragMode === 'trimEnd' ||
+    dragMode === 'cutEnd' ||
+    dragMode === 'pieceStart' ||
+    dragMode === 'pieceEnd'
+      ? 'cursor-ew-resize'
+      : 'cursor-pointer'
+
   return (
     <div className="relative z-30 w-full select-none overflow-visible">
       <div
         ref={trackRef}
-        className={cn(
-          'relative h-14 w-full overflow-visible rounded-xl bg-neutral-100 ring-1 ring-neutral-200',
-          dragMode === 'trimStart' ||
-            dragMode === 'trimEnd' ||
-            dragMode === 'cutEnd' ||
-            dragMode === 'pieceStart' ||
-            dragMode === 'pieceEnd'
-            ? 'cursor-ew-resize'
-            : 'cursor-pointer',
-        )}
+        className={cn('relative flex w-full flex-col gap-1 overflow-visible', resizeCursor)}
         onPointerMove={(event) => {
           if (dragMode || plusMenu) return
           const source = sourceFromClientX(event.clientX)
@@ -692,56 +783,91 @@ export function CapCutTimeline({
 
           if (source < trimStart || source > trimEnd) return
 
-          seekFromAssembly(assemblyFromClientX(event.clientX))
-          setDragMode('playhead')
-          onDragChange?.(true)
+          beginPlayheadGesture(event.clientX)
         }}
       >
-        {/* Discarded head / tail (outside the kept progress container) */}
-        {trimStart > 0.01 ? (
-          <div
-            className="pointer-events-none absolute inset-y-2 left-0 rounded-l-lg bg-neutral-200/80"
-            style={{ width: `${clipLeftPct}%` }}
+        {/* Video lane */}
+        <TimelineLane>
+          <DiscardedRegions
+            trimStart={trimStart}
+            trimEnd={trimEnd}
+            sourceSpan={sourceSpan}
+            clipLeftPct={clipLeftPct}
+            clipWidthPct={clipWidthPct}
           />
-        ) : null}
-        {trimEnd < sourceSpan - 0.01 ? (
           <div
-            className="pointer-events-none absolute inset-y-2 right-0 rounded-r-lg bg-neutral-200/80"
-            style={{ width: `${100 - clipLeftPct - clipWidthPct}%` }}
-          />
-        ) : null}
-
-        {/* Progress container — trims with start/end handles */}
-        <div
-          className="absolute inset-y-2 z-[1] overflow-hidden rounded-lg ring-1 ring-[#5234d2]/35"
-          style={{ left: `${clipLeftPct}%`, width: `${clipWidthPct}%` }}
-        >
-          <div className="pointer-events-none absolute inset-0 flex">
-            {pieces.length === 0 ? (
-              <div className="h-full w-full bg-[#5234d2]/35" />
-            ) : (
-              pieces.map((piece) => (
-                <AssemblySegment key={pieceKey(piece)} piece={piece} span={span} />
-              ))
-            )}
+            className="absolute inset-y-1 z-[1] overflow-hidden rounded-md ring-1 ring-[#5234d2]/35"
+            style={{ left: `${clipLeftPct}%`, width: `${clipWidthPct}%` }}
+          >
+            <div className="pointer-events-none absolute inset-0 flex">
+              {pieces.length === 0 ? (
+                <div className="h-full w-full bg-[#5234d2]/35" />
+              ) : (
+                pieces.map((piece) => (
+                  <AssemblySegment key={pieceKey(piece)} piece={piece} span={span} />
+                ))
+              )}
+            </div>
           </div>
-        </div>
+          {cutDraft && cutDraftStyle ? (
+            <div
+              className="pointer-events-none absolute inset-y-1 z-[2] rounded-md bg-red-500/45 ring-1 ring-red-600"
+              style={cutDraftStyle}
+            />
+          ) : null}
+        </TimelineLane>
 
-        {project.overlayAudio ? (
-          <InsertedAudioBed
-            project={project}
-            clip={project.overlayAudio}
-            assemblyToTrackPct={assemblyToTrackPct}
+        {/* Video audio (waveform) lane */}
+        <TimelineLane>
+          <DiscardedRegions
+            trimStart={trimStart}
+            trimEnd={trimEnd}
+            sourceSpan={sourceSpan}
+            clipLeftPct={clipLeftPct}
+            clipWidthPct={clipWidthPct}
           />
-        ) : pendingAudioAtEditedS != null ? (
-          <PendingAudioCue
-            project={project}
-            editedTime={pendingAudioAtEditedS}
-            assemblyToTrackPct={assemblyToTrackPct}
-          />
+          <div
+            className="absolute inset-y-1 z-[1] overflow-hidden rounded-md bg-[#5234d2]/10 ring-1 ring-[#5234d2]/20"
+            style={{ left: `${clipLeftPct}%`, width: `${clipWidthPct}%` }}
+          >
+            <div className="pointer-events-none absolute inset-0 flex items-center">
+              {pieces.length === 0 ? (
+                <WaveformFallback className="w-full" />
+              ) : (
+                pieces.map((piece) => (
+                  <AudioAssemblySegment
+                    key={`audio-${pieceKey(piece)}`}
+                    piece={piece}
+                    span={span}
+                    peaks={waveformPeaks}
+                    sourceDuration={sourceDuration}
+                  />
+                ))
+              )}
+            </div>
+          </div>
+        </TimelineLane>
+
+        {/* Inserted audio lane */}
+        {showInsertedAudioLane ? (
+          <TimelineLane>
+            {project.overlayAudio ? (
+              <InsertedAudioBed
+                project={project}
+                clip={project.overlayAudio}
+                assemblyToTrackPct={assemblyToTrackPct}
+              />
+            ) : pendingAudioAtEditedS != null ? (
+              <PendingAudioCue
+                project={project}
+                editedTime={pendingAudioAtEditedS}
+                assemblyToTrackPct={assemblyToTrackPct}
+              />
+            ) : null}
+          </TimelineLane>
         ) : null}
 
-        {/* Remove zones + edge handles for cuts + frames (above playhead, like trim) */}
+        {/* Shared chrome spanning all lanes */}
         {pieces.map((piece) => {
           if (piece.kind === 'video') return null
           const left = assemblyToTrackPct(piece.assemblyStart)
@@ -761,7 +887,7 @@ export function CapCutTimeline({
                 type="button"
                 data-timeline-chrome
                 aria-label={piece.kind === 'cut' ? 'Remove cut and restore footage' : 'Remove frame'}
-                className="absolute left-1/2 top-1/2 z-[1] flex size-6 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-md bg-white text-neutral-800 opacity-0 shadow-sm ring-1 ring-neutral-200 transition group-hover:opacity-100 hover:bg-neutral-50"
+                className="absolute left-1/2 top-1/2 z-[1] flex size-5 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-md bg-white text-neutral-800 opacity-0 shadow-sm ring-1 ring-neutral-200 transition group-hover:opacity-100 hover:bg-neutral-50"
                 onClick={(event) => {
                   event.stopPropagation()
                   if (piece.kind === 'cut') onRemoveCut(piece.id)
@@ -769,7 +895,7 @@ export function CapCutTimeline({
                 }}
               >
                 <Trash2
-                  className={cn('size-3.5', piece.kind === 'cut' && 'text-red-600')}
+                  className={cn('size-3', piece.kind === 'cut' && 'text-red-600')}
                   strokeWidth={2.25}
                 />
               </button>
@@ -778,7 +904,7 @@ export function CapCutTimeline({
                 data-timeline-chrome
                 role="slider"
                 aria-label={piece.kind === 'cut' ? 'Resize cut start' : 'Resize frame start'}
-                className="absolute inset-y-0 left-0 z-[2] w-10 -translate-x-1/2 cursor-ew-resize touch-none"
+                className="absolute inset-y-0 left-0 z-[2] w-8 -translate-x-1/2 cursor-ew-resize touch-none"
                 onPointerDown={(event) => {
                   event.stopPropagation()
                   event.preventDefault()
@@ -789,7 +915,7 @@ export function CapCutTimeline({
                   className={cn(
                     'pointer-events-none absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 rounded-full shadow transition-all',
                     handleColor,
-                    startActive ? 'h-12 w-2.5 ring-4' : 'h-10 w-1.5',
+                    startActive ? 'h-8 w-2 ring-4' : 'h-6 w-1',
                   )}
                 />
               </div>
@@ -798,7 +924,7 @@ export function CapCutTimeline({
                 data-timeline-chrome
                 role="slider"
                 aria-label={piece.kind === 'cut' ? 'Resize cut end' : 'Resize frame end'}
-                className="absolute inset-y-0 right-0 z-[2] w-10 translate-x-1/2 cursor-ew-resize touch-none"
+                className="absolute inset-y-0 right-0 z-[2] w-8 translate-x-1/2 cursor-ew-resize touch-none"
                 onPointerDown={(event) => {
                   event.stopPropagation()
                   event.preventDefault()
@@ -809,7 +935,7 @@ export function CapCutTimeline({
                   className={cn(
                     'pointer-events-none absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 rounded-full shadow transition-all',
                     handleColor,
-                    endActive ? 'h-12 w-2.5 ring-4' : 'h-10 w-1.5',
+                    endActive ? 'h-8 w-2 ring-4' : 'h-6 w-1',
                   )}
                 />
               </div>
@@ -817,14 +943,6 @@ export function CapCutTimeline({
           )
         })}
 
-        {cutDraft && cutDraftStyle ? (
-          <div
-            className="pointer-events-none absolute inset-y-2 z-[2] rounded-md bg-red-500/45 ring-1 ring-red-600"
-            style={cutDraftStyle}
-          />
-        ) : null}
-
-        {/* Trim handles on the progress container edges */}
         <div
           data-timeline-chrome
           role="slider"
@@ -832,7 +950,7 @@ export function CapCutTimeline({
           aria-valuemin={0}
           aria-valuemax={trimEnd - MIN_TRIM_SPAN}
           aria-valuenow={trimStart}
-          className="absolute inset-y-0 z-20 w-10 -translate-x-1/2 cursor-ew-resize touch-none"
+          className="absolute inset-y-0 z-20 w-8 -translate-x-1/2 cursor-ew-resize touch-none"
           style={{ left: `${clipLeftPct}%` }}
           onPointerDown={(event) => {
             event.stopPropagation()
@@ -843,7 +961,7 @@ export function CapCutTimeline({
           <div
             className={cn(
               'pointer-events-none absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 rounded-full bg-[#5234d2] shadow transition-all',
-              dragMode === 'trimStart' ? 'h-12 w-2.5 ring-4 ring-[#5234d2]/25' : 'h-10 w-1.5',
+              dragMode === 'trimStart' ? 'h-8 w-2 ring-4 ring-[#5234d2]/25' : 'h-6 w-1',
             )}
           />
         </div>
@@ -855,7 +973,7 @@ export function CapCutTimeline({
           aria-valuemin={trimStart + MIN_TRIM_SPAN}
           aria-valuemax={sourceSpan}
           aria-valuenow={trimEnd}
-          className="absolute inset-y-0 z-20 w-10 -translate-x-1/2 cursor-ew-resize touch-none"
+          className="absolute inset-y-0 z-20 w-8 -translate-x-1/2 cursor-ew-resize touch-none"
           style={{ left: `${clipLeftPct + clipWidthPct}%` }}
           onPointerDown={(event) => {
             event.stopPropagation()
@@ -866,12 +984,11 @@ export function CapCutTimeline({
           <div
             className={cn(
               'pointer-events-none absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 rounded-full bg-[#5234d2] shadow transition-all',
-              dragMode === 'trimEnd' ? 'h-12 w-2.5 ring-4 ring-[#5234d2]/25' : 'h-10 w-1.5',
+              dragMode === 'trimEnd' ? 'h-8 w-2 ring-4 ring-[#5234d2]/25' : 'h-6 w-1',
             )}
           />
         </div>
 
-        {/* Playhead — hidden while hover + line is shown or while over cut/frame edges */}
         {showPlayhead ? (
           <div
             data-timeline-chrome
@@ -885,22 +1002,19 @@ export function CapCutTimeline({
             onPointerDown={(event) => {
               event.stopPropagation()
               event.preventDefault()
-              seekFromAssembly(assemblyFromClientX(event.clientX))
-              setDragMode('playhead')
-              onDragChange?.(true)
+              beginPlayheadGesture(event.clientX)
             }}
           >
             <div className="pointer-events-none absolute inset-y-0 left-1/2 w-0.5 -translate-x-1/2 bg-neutral-900" />
           </div>
         ) : null}
 
-        {/* Hover scrub line: single stroke under the + (playhead stays hidden while this is up) */}
         {showHoverPlayLine ? (
           <div
             className="pointer-events-none absolute inset-y-0 z-[9]"
             style={{ left: `${plusTrackPct}%` }}
           >
-            <div className="absolute left-1/2 top-2.5 bottom-0 w-0.5 -translate-x-1/2 rounded-full bg-[#5234d2]" />
+            <div className="absolute left-1/2 top-2 bottom-0 w-0.5 -translate-x-1/2 rounded-full bg-[#5234d2]" />
             <div
               data-timeline-chrome
               data-plus-anchor
@@ -1039,6 +1153,117 @@ function pieceKey(piece: AssemblyPiece): string {
   return `${piece.kind}-${piece.id}`
 }
 
+function TimelineLane({ children }: { children: ReactNode }) {
+  return (
+    <div
+      className={cn(
+        'relative w-full overflow-visible rounded-lg bg-neutral-100 ring-1 ring-neutral-200',
+        LANE_HEIGHT_CLASS,
+      )}
+    >
+      {children}
+    </div>
+  )
+}
+
+function DiscardedRegions({
+  trimStart,
+  trimEnd,
+  sourceSpan,
+  clipLeftPct,
+  clipWidthPct,
+}: {
+  trimStart: number
+  trimEnd: number
+  sourceSpan: number
+  clipLeftPct: number
+  clipWidthPct: number
+}) {
+  return (
+    <>
+      {trimStart > 0.01 ? (
+        <div
+          className="pointer-events-none absolute inset-y-1 left-0 rounded-l-md bg-neutral-200/80"
+          style={{ width: `${clipLeftPct}%` }}
+        />
+      ) : null}
+      {trimEnd < sourceSpan - 0.01 ? (
+        <div
+          className="pointer-events-none absolute inset-y-1 right-0 rounded-r-md bg-neutral-200/80"
+          style={{ width: `${100 - clipLeftPct - clipWidthPct}%` }}
+        />
+      ) : null}
+    </>
+  )
+}
+
+function WaveformFallback({ className }: { className?: string }) {
+  return <div className={cn('h-1/2 rounded-sm bg-[#5234d2]/40', className)} />
+}
+
+function AudioAssemblySegment({
+  piece,
+  span,
+  peaks,
+  sourceDuration,
+}: {
+  piece: AssemblyPiece
+  span: number
+  peaks: number[] | null
+  sourceDuration: number
+}) {
+  const widthPct = (piece.duration / span) * 100
+
+  if (piece.kind === 'cut') {
+    return (
+      <div
+        className="h-full shrink-0 bg-red-400/25"
+        style={{ width: `${widthPct}%` }}
+        title={`Cut out ${formatDuration(Math.floor(piece.sourceStart))}–${formatDuration(Math.floor(piece.sourceEnd))}`}
+      />
+    )
+  }
+
+  if (piece.kind === 'black') {
+    return (
+      <div
+        className="h-full shrink-0 bg-neutral-900/40"
+        style={{ width: `${widthPct}%` }}
+        title={`Frame ${piece.duration.toFixed(1)}s`}
+      />
+    )
+  }
+
+  const slice =
+    peaks && peaks.length > 0
+      ? slicePeaksForSourceRange(peaks, piece.sourceStart, piece.sourceEnd, sourceDuration)
+      : null
+
+  if (!slice || slice.length === 0) {
+    return (
+      <div className="flex h-full shrink-0 items-center px-0.5" style={{ width: `${widthPct}%` }}>
+        <WaveformFallback className="w-full" />
+      </div>
+    )
+  }
+
+  return (
+    <div
+      className="flex h-full shrink-0 items-center gap-px px-0.5"
+      style={{ width: `${widthPct}%` }}
+      title={`Audio ${formatDuration(Math.floor(piece.sourceStart))}–${formatDuration(Math.floor(piece.sourceEnd))}`}
+    >
+      {slice.map((peak, index) => (
+        <div
+          key={index}
+          className="min-w-px flex-1 rounded-[1px] bg-[#5234d2]/75"
+          style={{ height: `${Math.max(12, peak * 100)}%` }}
+        />
+      ))}
+    </div>
+  )
+}
+
 function InsertedAudioBed({
   project,
   clip,
@@ -1056,16 +1281,13 @@ function InsertedAudioBed({
 
   return (
     <div
-      className="pointer-events-none absolute inset-y-2 z-[3]"
+      className="pointer-events-none absolute inset-y-1 z-[3] overflow-hidden rounded-md"
       style={{ left: `${left}%`, width: `${width}%` }}
       title={`Inserted audio · starts ${clip.startAtEditedS.toFixed(1)}s · ${clip.durationS.toFixed(1)}s`}
     >
-      {/* Soft overlay on the recording progress bar */}
-      <div className="absolute inset-0 bg-emerald-400/25 mix-blend-multiply" />
-      {/* Start marker line */}
-      <div className="absolute inset-y-0 left-0 w-0.5 bg-emerald-600 shadow-[0_0_0_1px_rgba(5,150,105,0.35)]" />
-      {/* Thin bed along the bottom edge */}
-      <div className="absolute inset-x-0 bottom-0 h-1.5 rounded-sm bg-emerald-500/90" />
+      <div className="absolute inset-0 bg-emerald-400/35" />
+      <div className="absolute inset-y-0 left-0 w-0.5 bg-emerald-600" />
+      <div className="absolute inset-x-0 bottom-0 top-1/3 rounded-sm bg-emerald-500/85" />
     </div>
   )
 }
@@ -1082,7 +1304,7 @@ function PendingAudioCue({
   const left = assemblyToTrackPct(editedToAssembly(project, editedTime))
   return (
     <div
-      className="pointer-events-none absolute inset-y-2 z-[3] -translate-x-1/2"
+      className="pointer-events-none absolute inset-y-1 z-[3] -translate-x-1/2"
       style={{ left: `${left}%` }}
       title={`Audio cue at ${editedTime.toFixed(1)}s — assign a clip in the Audio panel`}
     >

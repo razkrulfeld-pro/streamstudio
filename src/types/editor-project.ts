@@ -424,6 +424,76 @@ export function buildAssemblyPieces(project: EditorProject): AssemblyPiece[] {
   return pieces
 }
 
+/**
+ * Ordered export passes. Cuts are explicit skip steps so the encoder can stay
+ * paused while source playback continues — avoiding fragile WebM seeks that
+ * bake freeze frames and accidentally keep cut-out footage.
+ */
+export type ExportPlanStep =
+  | {
+      kind: 'video'
+      sourceStart: number
+      sourceEnd: number
+      timelineStart: number
+      timelineEnd: number
+    }
+  | {
+      kind: 'cut'
+      id: string
+      sourceStart: number
+      sourceEnd: number
+    }
+  | {
+      kind: 'black'
+      id: string
+      durationS: number
+      holdSourceTime: number
+      timelineStart: number
+      timelineEnd: number
+    }
+
+export function buildExportPlan(project: EditorProject): ExportPlanStep[] {
+  const pieces = buildAssemblyPieces(project)
+  const steps: ExportPlanStep[] = []
+  let timeline = 0
+
+  for (const piece of pieces) {
+    if (piece.kind === 'video') {
+      steps.push({
+        kind: 'video',
+        sourceStart: piece.sourceStart,
+        sourceEnd: piece.sourceEnd,
+        timelineStart: timeline,
+        timelineEnd: timeline + piece.duration,
+      })
+      timeline += piece.duration
+      continue
+    }
+
+    if (piece.kind === 'cut') {
+      steps.push({
+        kind: 'cut',
+        id: piece.id,
+        sourceStart: piece.sourceStart,
+        sourceEnd: piece.sourceEnd,
+      })
+      continue
+    }
+
+    steps.push({
+      kind: 'black',
+      id: piece.id,
+      durationS: piece.duration,
+      holdSourceTime: piece.holdSourceTime,
+      timelineStart: timeline,
+      timelineEnd: timeline + piece.duration,
+    })
+    timeline += piece.duration
+  }
+
+  return steps
+}
+
 export function getAssemblyDuration(project: EditorProject): number {
   const pieces = buildAssemblyPieces(project)
   if (pieces.length === 0) return 0

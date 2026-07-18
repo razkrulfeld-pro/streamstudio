@@ -3,6 +3,9 @@ export interface UploadMetadata {
   description?: string
   privacy_status: 'public' | 'private' | 'unlisted'
   category_id?: string
+  tags?: string[]
+  made_for_kids?: boolean
+  contains_synthetic_media?: boolean
   mime_type?: string
 }
 

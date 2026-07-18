@@ -1,8 +1,11 @@
 import { PublishReviewForm } from '@/components/publish/PublishReviewForm'
+import { PublishSuccessState } from '@/components/publish/PublishSuccessState'
+import { PublishUploadLoader } from '@/components/publish/PublishUploadLoader'
 import { exportEditedVideo } from '@/lib/export-edited-video'
 import { usePublish } from '@/hooks/usePublish'
 import { toUploadMetadata } from '@/lib/recording-session-state'
 import type { UploadResult } from '@/lib/types/youtube'
+import { getCombinedPublishProgress } from '@/lib/youtube-upload-options'
 import { getEditedDuration } from '@/types/editor-project'
 import type { EditorProject } from '@/types/editor-project'
 import type { SessionYouTubeMetadata } from '@/types/session'
@@ -46,13 +49,14 @@ export function PublishButton({
   const [localError, setLocalError] = useState<string | null>(null)
 
   useEffect(() => {
-    if (open) {
-      setDraftMetadata(publishMetadata)
-      setLocalError(null)
-      setPhase('idle')
-      setExportProgress(0)
-    }
-  }, [open, publishMetadata])
+    if (!open) return
+    setDraftMetadata(publishMetadata)
+    setLocalError(null)
+    setPhase('idle')
+    setExportProgress(0)
+    // Sync only when the dialog opens; live edits go through handleMetadataChange.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- avoid resetting mid-upload on parent metadata updates
+  }, [open])
 
   const handleMetadataChange = (metadata: SessionYouTubeMetadata) => {
     setDraftMetadata(metadata)
@@ -94,22 +98,17 @@ export function PublishButton({
     }
   }
 
+  const busy = phase === 'exporting' || status === 'uploading'
+
   const handleClose = () => {
-    if (status === 'uploading' || phase === 'exporting') return
+    if (busy) return
     setOpen(false)
     setPhase('idle')
     if (status === 'success' || status === 'error') reset()
   }
 
-  const busy = phase === 'exporting' || status === 'uploading'
   const displayError = localError || error
-  const displayProgress = phase === 'exporting' ? exportProgress : progress
-  const progressLabel =
-    phase === 'exporting'
-      ? 'Rendering edit…'
-      : status === 'uploading'
-        ? 'Uploading…'
-        : null
+  const combinedProgress = getCombinedPublishProgress(phase, exportProgress, progress)
 
   return (
     <>
@@ -132,36 +131,31 @@ export function PublishButton({
             role="dialog"
             aria-modal="true"
             aria-labelledby="publish-dialog-title"
-            className="w-full max-w-md rounded-2xl bg-white p-5 shadow-xl"
+            className="max-h-[90vh] w-full max-w-2xl overflow-y-auto rounded-2xl bg-white p-5 shadow-xl"
           >
             <h2 id="publish-dialog-title" className="text-lg font-semibold text-neutral-900">
-              Ready to upload
+              Review YouTube upload
             </h2>
             <p className="mt-1 text-sm text-neutral-500">
-              Everything else is pre-filled from your content type. Confirm the title to publish.
+              Adjust the details now. We&apos;ll render your edit, upload it to YouTube, then give
+              you the watch link.
             </p>
 
-            {status === 'idle' || status === 'error' || phase === 'exporting' ? (
+            {busy ? (
+              <PublishUploadLoader
+                phase={phase === 'exporting' ? 'exporting' : 'uploading'}
+                progress={combinedProgress}
+              />
+            ) : null}
+
+            {!busy && (status === 'idle' || status === 'error') ? (
               <div className="mt-4 space-y-3">
-                {phase === 'exporting' || status === 'uploading' ? (
-                  <div className="space-y-2">
-                    <p className="text-sm text-neutral-600">{progressLabel}</p>
-                    <div className="h-2 overflow-hidden rounded-full bg-neutral-100">
-                      <div
-                        className="h-full rounded-full bg-[#5234d2] transition-all"
-                        style={{ width: `${Math.max(2, displayProgress)}%` }}
-                      />
-                    </div>
-                    <p className="text-xs text-neutral-500">{Math.round(displayProgress)}%</p>
-                  </div>
-                ) : (
-                  <PublishReviewForm
-                    metadata={draftMetadata}
-                    contentTypeLabel={contentTypeLabel}
-                    onChange={handleMetadataChange}
-                    disabled={busy}
-                  />
-                )}
+                <PublishReviewForm
+                  metadata={draftMetadata}
+                  contentTypeLabel={contentTypeLabel}
+                  onChange={handleMetadataChange}
+                  disabled={busy}
+                />
 
                 {displayError ? <p className="text-sm text-red-600">{displayError}</p> : null}
 
@@ -174,54 +168,20 @@ export function PublishButton({
                   >
                     Cancel
                   </button>
-                  {phase === 'idle' ? (
-                    <button
-                      type="button"
-                      onClick={() => void handleConfirm()}
-                      disabled={!videoBlob || busy}
-                      className="rounded-lg bg-neutral-900 px-3 py-2 text-sm font-medium text-white hover:bg-neutral-800 disabled:opacity-40"
-                    >
-                      {status === 'error' ? 'Try Again' : 'Upload'}
-                    </button>
-                  ) : null}
+                  <button
+                    type="button"
+                    onClick={() => void handleConfirm()}
+                    disabled={!videoBlob || busy}
+                    className="rounded-lg bg-neutral-900 px-3 py-2 text-sm font-medium text-white hover:bg-neutral-800 disabled:opacity-40"
+                  >
+                    {status === 'error' ? 'Try Again' : 'Upload'}
+                  </button>
                 </div>
-              </div>
-            ) : null}
-
-            {status === 'uploading' && phase === 'uploading' ? (
-              <div className="mt-4 space-y-2">
-                <p className="text-sm text-neutral-600">Uploading…</p>
-                <div className="h-2 overflow-hidden rounded-full bg-neutral-100">
-                  <div
-                    className="h-full rounded-full bg-[#5234d2] transition-all"
-                    style={{ width: `${Math.max(2, progress)}%` }}
-                  />
-                </div>
-                <p className="text-xs text-neutral-500">{Math.round(progress)}%</p>
               </div>
             ) : null}
 
             {status === 'success' && result ? (
-              <div className="mt-4 space-y-3">
-                <p className="text-sm text-neutral-700">Published successfully.</p>
-                <a
-                  href={result.videoUrl}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="block text-sm font-medium text-[#5234d2] hover:underline"
-                >
-                  Open on YouTube
-                </a>
-                <div className="flex justify-end">
-                  <button
-                    type="button"
-                    onClick={handleClose}
-                    className="rounded-lg bg-neutral-900 px-3 py-2 text-sm font-medium text-white hover:bg-neutral-800"
-                  >
-                    Done
-                  </button>
-                </div>
-              </div>
+              <PublishSuccessState result={result} onDone={handleClose} />
             ) : null}
           </div>
         </div>

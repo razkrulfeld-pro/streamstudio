@@ -1,4 +1,5 @@
 import { formatDuration, formatRecordedDate } from '@/lib/format'
+import { getSessionType } from '@/lib/sessionTypes'
 import { cn } from '@/lib/utils'
 import { useRecordings } from '@/context/recordings-context'
 import type { Recording, RecordingStatus } from '@/types/recording'
@@ -16,6 +17,12 @@ const statusStyles: Record<RecordingStatus, string> = {
   draft: 'bg-white/85 text-neutral-700 ring-1 ring-black/5',
 }
 
+const lobbyTypeLabels = {
+  short: 'Short',
+  standard: 'Video',
+  square: 'Video',
+} as const
+
 export function RecordingCard({ recording }: { recording: Recording }) {
   const { removeRecording } = useRecordings()
   const menuId = useId()
@@ -24,6 +31,9 @@ export function RecordingCard({ recording }: { recording: Recording }) {
   const [confirmOpen, setConfirmOpen] = useState(false)
   const [isRemoving, setIsRemoving] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const contentType = getSessionType(recording.contentTypeId)
+  const isShort = contentType.id === 'short'
+  const typeLabel = lobbyTypeLabels[contentType.id]
 
   useEffect(() => {
     if (!menuOpen) return
@@ -63,11 +73,19 @@ export function RecordingCard({ recording }: { recording: Recording }) {
   return (
     <div className="group relative block">
       <Link to={`/editor-studio?recording=${recording.id}`} className="block">
-        <div className="relative aspect-video overflow-hidden rounded-xl bg-neutral-100">
+        <div
+          className={cn(
+            'relative flex aspect-video items-center justify-center overflow-hidden rounded-xl',
+            isShort ? 'bg-black' : 'bg-neutral-100',
+          )}
+        >
           <img
             src={recording.thumbnailUrl}
             alt=""
-            className="h-full w-full object-cover transition-transform duration-200 group-hover:scale-[1.02]"
+            className={cn(
+              'h-full transition-transform duration-200 group-hover:scale-[1.02]',
+              isShort ? 'w-auto max-w-full object-contain' : 'w-full object-cover',
+            )}
           />
           <span
             className={cn(
@@ -89,7 +107,8 @@ export function RecordingCard({ recording }: { recording: Recording }) {
             {recording.name}
           </h3>
           <p className="mt-1 text-xs text-neutral-500">
-            {formatRecordedDate(recording.recordedAt)} · {formatDuration(recording.durationSeconds)}
+            {typeLabel} · {formatRecordedDate(recording.recordedAt)} ·{' '}
+            {formatDuration(recording.durationSeconds)}
           </p>
         </Link>
 

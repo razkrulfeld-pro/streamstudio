@@ -62,6 +62,7 @@ interface EditorWorkspaceProps {
   youtubeConnected: boolean
   youtubeHint: string
   aspectRatio?: string
+  contentTypeLabel?: string
   publishMetadata: SessionYouTubeMetadata
   onPublishMetadataChange?: (metadata: SessionYouTubeMetadata) => void
   onSaveDraft: (project: EditorProject, options?: { overlayAudioBlob?: Blob | null }) => Promise<void>
@@ -85,6 +86,7 @@ export function EditorWorkspace({
   youtubeConnected,
   youtubeHint,
   aspectRatio = '16:9',
+  contentTypeLabel,
   publishMetadata,
   onPublishMetadataChange,
   onSaveDraft,
@@ -665,6 +667,46 @@ export function EditorWorkspace({
     return () => cancelAnimationFrame(raf)
   }, [project, editedDuration, seekEdited, syncOverlayToEdited, waitForSeek])
 
+  const playFromTimeline = useCallback(
+    async (startTimeline: number) => {
+      const video = videoRef.current
+      if (!video || editedDuration <= 0) return
+
+      const clamped = Math.min(Math.max(0, startTimeline), Math.max(0, editedDuration - 0.0001))
+      isSeekingRef.current = false
+      setIsSeeking(false)
+      stopCutPreview()
+      seekEdited(clamped)
+
+      const segment = findSegmentAtTimeline(project, clamped)
+      setIsPlaying(true)
+      isPlayingRef.current = true
+
+      if (segment?.kind === 'black') {
+        setInBlackFrame(true)
+        blackUntilRef.current =
+          performance.now() + Math.max(0.05, segment.timelineEnd - clamped) * 1000
+        return
+      }
+
+      const playSource = segment
+        ? segment.sourceStart + (clamped - segment.timelineStart)
+        : clampSourceToKept(project, sourceTime)
+
+      await waitForSeek(video, playSource)
+      lastPlaySourceRef.current = playSource
+      try {
+        video.muted = false
+        await video.play()
+      } catch {
+        video.muted = true
+        setIsPlaying(false)
+        isPlayingRef.current = false
+      }
+    },
+    [editedDuration, project, seekEdited, sourceTime, stopCutPreview, waitForSeek],
+  )
+
   const togglePlayback = async () => {
     const video = videoRef.current
     if (!video) return
@@ -685,34 +727,7 @@ export function EditorWorkspace({
       atEnd ? project.trimStart : sourceTime,
     )
     const startTimeline = atEnd ? 0 : resolved.timelineTime
-
-    seekEdited(startTimeline)
-    const playSource = clampSourceToKept(
-      project,
-      atEnd ? project.trimStart : resolved.sourceTime,
-    )
-
-    const segment = findSegmentAtTimeline(project, startTimeline)
-    setIsPlaying(true)
-    isPlayingRef.current = true
-
-    if (segment?.kind === 'black') {
-      setInBlackFrame(true)
-      blackUntilRef.current =
-        performance.now() + Math.max(0.05, segment.timelineEnd - startTimeline) * 1000
-      return
-    }
-
-    await waitForSeek(video, playSource)
-    lastPlaySourceRef.current = playSource
-    try {
-      video.muted = false
-      await video.play()
-    } catch {
-      video.muted = true
-      setIsPlaying(false)
-      isPlayingRef.current = false
-    }
+    await playFromTimeline(startTimeline)
   }
 
   const patchProject = (patch: Partial<EditorProject>) => {
@@ -840,6 +855,7 @@ export function EditorWorkspace({
                 overlayAudioBlob={overlayAudioBlob}
                 publishMetadata={{ ...publishMetadata, title: recordingName.trim() || publishMetadata.title }}
                 aspectRatio={aspectRatio}
+                contentTypeLabel={contentTypeLabel}
                 disabled={!youtubeConnected || isSaving}
                 disabledReason={
                   youtubeConnected ? youtubeHint : 'Connect YouTube in Settings before publishing.'
@@ -919,6 +935,9 @@ export function EditorWorkspace({
                   sourceDuration={sourceDuration}
                   timelineTime={timelineTime}
                   editedDuration={editedDuration}
+                  isPlaying={isPlaying}
+                  videoBlob={videoBlob}
+                  videoUrl={videoUrl}
                   onSeekTimeline={seekEdited}
                   onPreviewSource={previewCutRange}
                   onPlaceAudio={handlePlaceAudio}
@@ -952,6 +971,9 @@ export function EditorWorkspace({
                       blackFrames: project.blackFrames.filter((frame) => frame.id !== id),
                     })
                   }
+                  onPlayFromTimeline={(editedTime) => {
+                    void playFromTimeline(editedTime)
+                  }}
                   onDragChange={(dragging) => {
                     // Sync refs immediately — waiting for useEffect lets one RAF tick
                     // paint the black-frame overlay while resizing cuts/frames.
@@ -1049,6 +1071,7 @@ export function EditorWorkspace({
                     overlayAudioBlob={overlayAudioBlob}
                     publishMetadata={{ ...publishMetadata, title: recordingName.trim() || publishMetadata.title }}
                     aspectRatio={aspectRatio}
+                    contentTypeLabel={contentTypeLabel}
                     youtubeConnected={youtubeConnected}
                     youtubeHint={youtubeHint}
                     disabled={isSaving}
@@ -1391,6 +1414,7 @@ function ExportPanel({
   overlayAudioBlob,
   publishMetadata,
   aspectRatio,
+  contentTypeLabel,
   youtubeConnected,
   youtubeHint,
   disabled,
@@ -1402,6 +1426,7 @@ function ExportPanel({
   overlayAudioBlob: Blob | null
   publishMetadata: SessionYouTubeMetadata
   aspectRatio: string
+  contentTypeLabel?: string
   youtubeConnected: boolean
   youtubeHint: string
   disabled: boolean
@@ -1421,6 +1446,7 @@ function ExportPanel({
         overlayAudioBlob={overlayAudioBlob}
         publishMetadata={publishMetadata}
         aspectRatio={aspectRatio}
+        contentTypeLabel={contentTypeLabel}
         disabled={!youtubeConnected || disabled}
         disabledReason={
           youtubeConnected ? youtubeHint : 'Connect YouTube in Settings before publishing.'

@@ -18,6 +18,27 @@ export interface CapturePaintSources {
   camera: VideoFrame | null
 }
 
+export function selectCaptureSources(options: {
+  latestCamera: VideoFrame | null
+  latestCameraAt: number
+  latestScreen: VideoFrame | null
+  latestScreenAt: number
+  now: number
+  staleAfterMs?: number
+}): CapturePaintSources {
+  const staleAfterMs = options.staleAfterMs ?? 500
+  return {
+    camera:
+      options.latestCamera && options.now - options.latestCameraAt <= staleAfterMs
+        ? options.latestCamera
+        : null,
+    screen:
+      options.latestScreen && options.now - options.latestScreenAt <= staleAfterMs
+        ? options.latestScreen
+        : null,
+  }
+}
+
 function getTrackProcessorCtor(): TrackProcessorCtor | null {
   const ctor = (globalThis as unknown as { MediaStreamTrackProcessor?: TrackProcessorCtor })
     .MediaStreamTrackProcessor
@@ -70,6 +91,8 @@ export function startRecordingCaptureClock(options: {
   let worker: Worker | null = null
   let latestCamera: VideoFrame | null = null
   let latestScreen: VideoFrame | null = null
+  let latestCameraAt = 0
+  let latestScreenAt = 0
 
   const isStopped = () => stopped
 
@@ -78,14 +101,6 @@ export function startRecordingCaptureClock(options: {
     if (track && typeof track.requestFrame === 'function') {
       track.requestFrame()
     }
-  }
-
-  const paintNow = () => {
-    options.paint({
-      screen: latestScreen,
-      camera: latestCamera,
-    })
-    pushCaptureFrame()
   }
 
   const stop = () => {
@@ -135,8 +150,7 @@ export function startRecordingCaptureClock(options: {
         (frame) => {
           latestCamera?.close()
           latestCamera = frame
-          // Camera-only: camera frames drive paint cadence.
-          if (!resolvedScreen) paintNow()
+          latestCameraAt = performance.now()
         },
         isStopped,
       )
@@ -154,17 +168,16 @@ export function startRecordingCaptureClock(options: {
         (frame) => {
           latestScreen?.close()
           latestScreen = frame
-          // Screen frames drive paint when present (camera uses latest held frame).
-          paintNow()
+          latestScreenAt = performance.now()
         },
         isStopped,
       )
     }
-
-    return { stop }
   }
 
-  // Fallback: worker ticks are less throttled than page timers when hidden.
+  // An independent cadence keeps stickers/effects moving even if a track
+  // processor stalls. Fresh VideoFrames remain background-safe; stale ones
+  // fall back to the live HTMLVideoElement sources in the compositor.
   const workerSource = `
     let id = 0;
     self.onmessage = (event) => {
@@ -182,7 +195,15 @@ export function startRecordingCaptureClock(options: {
   URL.revokeObjectURL(url)
   worker.onmessage = () => {
     if (stopped) return
-    options.paint({ screen: null, camera: null })
+    options.paint(
+      selectCaptureSources({
+        latestCamera,
+        latestCameraAt,
+        latestScreen,
+        latestScreenAt,
+        now: performance.now(),
+      }),
+    )
     pushCaptureFrame()
   }
   worker.postMessage('start')

@@ -1,0 +1,364 @@
+diff --git a/src/components/PublishButton.tsx b/src/components/PublishButton.tsx
+index 1fd0bbf..78a6c4d 100644
+--- a/src/components/PublishButton.tsx
++++ b/src/components/PublishButton.tsx
+@@ -1,8 +1,11 @@
++import { PublishReviewForm } from '@/components/publish/PublishReviewForm'
+ import { exportEditedVideo } from '@/lib/export-edited-video'
+ import { usePublish } from '@/hooks/usePublish'
+-import type { UploadMetadata, UploadResult } from '@/lib/types/youtube'
++import { toUploadMetadata } from '@/lib/recording-session-state'
++import type { UploadResult } from '@/lib/types/youtube'
++import { getEditedDuration } from '@/types/editor-project'
+ import type { EditorProject } from '@/types/editor-project'
+-import type { YoutubeVisibility } from '@/types/settings'
++import type { SessionYouTubeMetadata } from '@/types/session'
+ import { cn } from '@/lib/utils'
+ import { useEffect, useState } from 'react'
+ 
+@@ -11,69 +14,78 @@ interface PublishButtonProps {
+   project: EditorProject
+   /** IndexedDB overlay clip blob to bake into the exported video. */
+   overlayAudioBlob?: Blob | null
+-  defaultTitle: string
+-  defaultDescription?: string
+-  defaultPrivacy?: YoutubeVisibility
+-  defaultCategoryId?: string
++  publishMetadata: SessionYouTubeMetadata
++  /** Session aspect (e.g. 9:16) so Shorts exports keep portrait dimensions. */
++  aspectRatio?: string
+   disabled?: boolean
+   disabledReason?: string
+   className?: string
++  contentTypeLabel?: string
+   onPublished?: (result: UploadResult) => void | Promise<void>
++  onPublishMetadataChange?: (metadata: SessionYouTubeMetadata) => void
+ }
+ 
+ export function PublishButton({
+   videoBlob,
+   project,
+   overlayAudioBlob = null,
+-  defaultTitle,
+-  defaultDescription = '',
+-  defaultPrivacy = 'unlisted',
+-  defaultCategoryId = '22',
++  publishMetadata,
++  aspectRatio,
+   disabled = false,
+   disabledReason,
+   className,
++  contentTypeLabel,
+   onPublished,
++  onPublishMetadataChange,
+ }: PublishButtonProps) {
+   const { status, progress, result, error, publish, reset } = usePublish()
+   const [open, setOpen] = useState(false)
+-  const [title, setTitle] = useState(defaultTitle)
+-  const [description, setDescription] = useState(defaultDescription)
+-  const [privacy, setPrivacy] = useState<YoutubeVisibility>(defaultPrivacy)
++  const [draftMetadata, setDraftMetadata] = useState(publishMetadata)
+   const [phase, setPhase] = useState<'idle' | 'exporting' | 'uploading'>('idle')
+   const [exportProgress, setExportProgress] = useState(0)
+   const [localError, setLocalError] = useState<string | null>(null)
+ 
+   useEffect(() => {
+     if (open) {
+-      setTitle(defaultTitle)
+-      setDescription(defaultDescription)
+-      setPrivacy(defaultPrivacy)
++      setDraftMetadata(publishMetadata)
+       setLocalError(null)
+       setPhase('idle')
+       setExportProgress(0)
+     }
+-  }, [open, defaultTitle, defaultDescription, defaultPrivacy])
++  }, [open, publishMetadata])
++
++  const handleMetadataChange = (metadata: SessionYouTubeMetadata) => {
++    setDraftMetadata(metadata)
++    onPublishMetadataChange?.(metadata)
++  }
+ 
+   const handleConfirm = async () => {
+     if (!videoBlob) return
+     setLocalError(null)
+ 
++    const editedDuration = getEditedDuration(project)
++    const maxDuration = draftMetadata.maxDurationSeconds
++    if (maxDuration != null && editedDuration > maxDuration) {
++      setLocalError(
++        `This edit is ${Math.ceil(editedDuration)}s — the ${maxDuration}s limit for this format was exceeded. Trim the timeline before uploading.`,
++      )
++      return
++    }
++
+     try {
+       setPhase('exporting')
+       setExportProgress(0)
+       const exportBlob = await exportEditedVideo(videoBlob, project, {
+         overlayAudioBlob,
++        aspectRatio,
+         onProgress: (percent) => setExportProgress(percent),
+       })
+ 
+       setPhase('uploading')
+-      const metadata: UploadMetadata = {
+-        title: title.trim() || 'Untitled recording',
+-        description,
+-        privacy_status: privacy,
+-        category_id: defaultCategoryId,
+-        mime_type: exportBlob.type || 'video/webm',
+-      }
++      const metadata = toUploadMetadata(
++        { ...draftMetadata, title: draftMetadata.title.trim() || 'Untitled recording' },
++        exportBlob.type || 'video/webm',
++      )
+       const uploadResult = await publish(exportBlob, metadata)
+       await onPublished?.(uploadResult)
+     } catch (err) {
+@@ -123,8 +135,11 @@ export function PublishButton({
+             className="w-full max-w-md rounded-2xl bg-white p-5 shadow-xl"
+           >
+             <h2 id="publish-dialog-title" className="text-lg font-semibold text-neutral-900">
+-              Publish to YouTube
++              Ready to upload
+             </h2>
++            <p className="mt-1 text-sm text-neutral-500">
++              Everything else is pre-filled from your content type. Confirm the title to publish.
++            </p>
+ 
+             {status === 'idle' || status === 'error' || phase === 'exporting' ? (
+               <div className="mt-4 space-y-3">
+@@ -140,40 +155,12 @@ export function PublishButton({
+                     <p className="text-xs text-neutral-500">{Math.round(displayProgress)}%</p>
+                   </div>
+                 ) : (
+-                  <>
+-                    <label className="block">
+-                      <span className="mb-1.5 block text-sm font-medium text-neutral-700">Title</span>
+-                      <input
+-                        type="text"
+-                        value={title}
+-                        onChange={(event) => setTitle(event.target.value)}
+-                        className="w-full rounded-lg border border-neutral-200 px-3 py-2 text-sm outline-none focus:border-neutral-400"
+-                      />
+-                    </label>
+-                    <label className="block">
+-                      <span className="mb-1.5 block text-sm font-medium text-neutral-700">
+-                        Description
+-                      </span>
+-                      <textarea
+-                        value={description}
+-                        onChange={(event) => setDescription(event.target.value)}
+-                        rows={3}
+-                        className="w-full resize-none rounded-lg border border-neutral-200 px-3 py-2 text-sm outline-none focus:border-neutral-400"
+-                      />
+-                    </label>
+-                    <label className="block">
+-                      <span className="mb-1.5 block text-sm font-medium text-neutral-700">Privacy</span>
+-                      <select
+-                        value={privacy}
+-                        onChange={(event) => setPrivacy(event.target.value as YoutubeVisibility)}
+-                        className="w-full rounded-lg border border-neutral-200 px-3 py-2 text-sm outline-none focus:border-neutral-400"
+-                      >
+-                        <option value="private">Private</option>
+-                        <option value="unlisted">Unlisted</option>
+-                        <option value="public">Public</option>
+-                      </select>
+-                    </label>
+-                  </>
++                  <PublishReviewForm
++                    metadata={draftMetadata}
++                    contentTypeLabel={contentTypeLabel}
++                    onChange={handleMetadataChange}
++                    disabled={busy}
++                  />
+                 )}
+ 
+                 {displayError ? <p className="text-sm text-red-600">{displayError}</p> : null}
+@@ -194,7 +181,7 @@ export function PublishButton({
+                       disabled={!videoBlob || busy}
+                       className="rounded-lg bg-neutral-900 px-3 py-2 text-sm font-medium text-white hover:bg-neutral-800 disabled:opacity-40"
+                     >
+-                      {status === 'error' ? 'Try Again' : 'Confirm upload'}
++                      {status === 'error' ? 'Try Again' : 'Upload'}
+                     </button>
+                   ) : null}
+                 </div>
+diff --git a/src/components/publish/PublishReviewForm.tsx b/src/components/publish/PublishReviewForm.tsx
+new file mode 100644
+index 0000000..7c75f86
+--- /dev/null
++++ b/src/components/publish/PublishReviewForm.tsx
+@@ -0,0 +1,154 @@
++import {
++  categoryOptions,
++  formatTagsInput,
++  getCategoryLabel,
++  getVisibilityLabel,
++  parseTagsInput,
++  visibilityOptions,
++} from '@/lib/youtube-upload-options'
++import type { SessionYouTubeMetadata } from '@/types/session'
++import type { YoutubeVisibility } from '@/types/settings'
++import { useEffect, useState } from 'react'
++
++interface PublishReviewFormProps {
++  metadata: SessionYouTubeMetadata
++  contentTypeLabel?: string
++  onChange: (metadata: SessionYouTubeMetadata) => void
++  disabled?: boolean
++}
++
++export function PublishReviewForm({
++  metadata,
++  contentTypeLabel,
++  onChange,
++  disabled = false,
++}: PublishReviewFormProps) {
++  const [tagsInput, setTagsInput] = useState(() => formatTagsInput(metadata.tags))
++
++  useEffect(() => {
++    setTagsInput(formatTagsInput(metadata.tags))
++  }, [metadata.tags])
++
++  const updateMetadata = (patch: Partial<SessionYouTubeMetadata>) => {
++    onChange({ ...metadata, ...patch })
++  }
++
++  return (
++    <div className="space-y-4">
++      <div className="rounded-xl border border-neutral-200 bg-neutral-50 px-3 py-2.5">
++        <p className="text-xs font-medium uppercase tracking-[0.16em] text-neutral-400">
++          Recording setup
++        </p>
++        <div className="mt-2 flex flex-wrap gap-2 text-xs text-neutral-700">
++          {contentTypeLabel ? (
++            <span className="rounded-full bg-white px-2.5 py-1 font-medium shadow-sm">
++              {contentTypeLabel}
++            </span>
++          ) : null}
++          <span className="rounded-full bg-white px-2.5 py-1 shadow-sm">
++            {getVisibilityLabel(metadata.privacy)}
++          </span>
++          <span className="rounded-full bg-white px-2.5 py-1 shadow-sm">
++            {getCategoryLabel(metadata.categoryId)}
++          </span>
++          {metadata.maxDurationSeconds != null ? (
++            <span className="rounded-full bg-white px-2.5 py-1 shadow-sm">
++              Max {metadata.maxDurationSeconds}s
++            </span>
++          ) : null}
++        </div>
++      </div>
++
++      <label className="block">
++        <span className="mb-1.5 block text-sm font-medium text-neutral-700">Title</span>
++        <input
++          type="text"
++          value={metadata.title}
++          disabled={disabled}
++          onChange={(event) => updateMetadata({ title: event.target.value })}
++          className="w-full rounded-lg border border-neutral-200 px-3 py-2 text-sm outline-none focus:border-neutral-400 focus:ring-2 focus:ring-neutral-100 disabled:opacity-50"
++        />
++        {metadata.titleSuffix ? (
++          <p className="mt-1 text-xs text-neutral-500">
++            Uploads as &ldquo;{metadata.title.trim() || 'Untitled recording'}
++            {metadata.titleSuffix}&rdquo;
++          </p>
++        ) : null}
++      </label>
++
++      <label className="block">
++        <span className="mb-1.5 block text-sm font-medium text-neutral-700">Description</span>
++        <textarea
++          value={metadata.description}
++          disabled={disabled}
++          rows={4}
++          onChange={(event) => updateMetadata({ description: event.target.value })}
++          className="w-full resize-y rounded-lg border border-neutral-200 px-3 py-2 text-sm outline-none focus:border-neutral-400 focus:ring-2 focus:ring-neutral-100 disabled:opacity-50"
++        />
++      </label>
++
++      <div className="grid gap-3 sm:grid-cols-2">
++        <label className="block">
++          <span className="mb-1.5 block text-sm font-medium text-neutral-700">Privacy</span>
++          <select
++            value={metadata.privacy}
++            disabled={disabled}
++            onChange={(event) =>
++              updateMetadata({ privacy: event.target.value as YoutubeVisibility })
++            }
++            className="w-full rounded-lg border border-neutral-200 bg-white px-3 py-2 text-sm outline-none focus:border-neutral-400 focus:ring-2 focus:ring-neutral-100 disabled:opacity-50"
++          >
++            {visibilityOptions.map((option) => (
++              <option key={option.id} value={option.id}>
++                {option.label}
++              </option>
++            ))}
++          </select>
++        </label>
++
++        <label className="block">
++          <span className="mb-1.5 block text-sm font-medium text-neutral-700">Category</span>
++          <select
++            value={metadata.categoryId}
++            disabled={disabled}
++            onChange={(event) => updateMetadata({ categoryId: event.target.value })}
++            className="w-full rounded-lg border border-neutral-200 bg-white px-3 py-2 text-sm outline-none focus:border-neutral-400 focus:ring-2 focus:ring-neutral-100 disabled:opacity-50"
++          >
++            {categoryOptions.map((option) => (
++              <option key={option.id} value={option.id}>
++                {option.label}
++              </option>
++            ))}
++          </select>
++        </label>
++      </div>
++
++      <label className="block">
++        <span className="mb-1.5 block text-sm font-medium text-neutral-700">Tags</span>
++        <input
++          type="text"
++          value={tagsInput}
++          disabled={disabled}
++          placeholder="comma, separated, tags"
++          onChange={(event) => {
++            const nextValue = event.target.value
++            setTagsInput(nextValue)
++            updateMetadata({ tags: parseTagsInput(nextValue) })
++          }}
++          className="w-full rounded-lg border border-neutral-200 px-3 py-2 text-sm outline-none focus:border-neutral-400 focus:ring-2 focus:ring-neutral-100 disabled:opacity-50"
++        />
++      </label>
++
++      <label className="flex items-center justify-between rounded-lg border border-neutral-200 px-3 py-2.5">
++        <span className="text-sm font-medium text-neutral-700">Made for kids</span>
++        <input
++          type="checkbox"
++          checked={metadata.madeForKids}
++          disabled={disabled}
++          onChange={(event) => updateMetadata({ madeForKids: event.target.checked })}
++          className="size-4 rounded border-neutral-300"
++        />
++      </label>
++    </div>
++  )
++}
+
+
+===== editor-workspace call-site changes (PublishButton usage only) =====
+7: import { PublishButton } from '@/components/PublishButton'
+46:+  onPublishMetadataChange?: (metadata: SessionYouTubeMetadata) => void
+61:+  onPublishMetadataChange,
+201:-            <PublishButton
+224:+              <PublishButton
+228:+                publishMetadata={{ ...publishMetadata, title: recordingName.trim() || publishMetadata.title }}
+234:+                onPublishMetadataChange={onPublishMetadataChange}
+288:+                    publishMetadata={{ ...publishMetadata, title: recordingName.trim() || publishMetadata.title }}
+296:+                    onPublishMetadataChange={onPublishMetadataChange}
+313:+  onPublishMetadataChange,
+328:+  onPublishMetadataChange?: (metadata: SessionYouTubeMetadata) => void
+340:+        publishMetadata={publishMetadata}
+346:+        onPublishMetadataChange={onPublishMetadataChange}

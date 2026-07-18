@@ -26,6 +26,9 @@ class InitiateUploadRequest(BaseModel):
     description: str = ""
     privacy_status: Literal["public", "private", "unlisted"] = "unlisted"
     category_id: str = "22"
+    tags: list[str] = []
+    made_for_kids: bool = False
+    contains_synthetic_media: bool = False
     mime_type: str = "video/webm"
 
 
@@ -44,10 +47,12 @@ def initiate_upload(body: InitiateUploadRequest) -> dict[str, str]:
             "title": body.title,
             "description": body.description,
             "categoryId": body.category_id,
+            "tags": body.tags,
         },
         "status": {
             "privacyStatus": body.privacy_status,
-            "selfDeclaredMadeForKids": False,
+            "selfDeclaredMadeForKids": body.made_for_kids,
+            "containsSyntheticMedia": body.contains_synthetic_media,
         },
     }
     headers = {

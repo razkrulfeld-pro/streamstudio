@@ -4,13 +4,20 @@ export const YOUTUBE_OUTPUT_HEIGHT = 1080
 export const YOUTUBE_OUTPUT_ASPECT = YOUTUBE_OUTPUT_WIDTH / YOUTUBE_OUTPUT_HEIGHT
 
 /**
- * Target encode settings for 1080p canvas capture / export.
- * Browser MediaRecorder defaults (~1–2.5 Mbps) look soft on YouTube at this size.
- * Prefer VP9 when available; YouTube’s recommended 1080p30 ballpark is ~8 Mbps —
- * we aim a bit higher for sharp screen content.
+ * Target encode settings for canvas capture / export.
+ * Browser MediaRecorder defaults (~1–2.5 Mbps) look soft on YouTube.
+ * Prefer VP9 when available; scale bitrate with pixel count.
  */
 export const YOUTUBE_VIDEO_BITS_PER_SECOND = 12_000_000
 export const YOUTUBE_AUDIO_BITS_PER_SECOND = 192_000
+
+/** ~12 Mbps at 1080p (≈2.07M px); scales for Shorts 1080×1920 and larger canvases. */
+export function videoBitsPerSecondForDimensions(width: number, height: number): number {
+  const pixels = Math.max(1, width * height)
+  const referencePixels = 1920 * 1080
+  const scaled = Math.round(YOUTUBE_VIDEO_BITS_PER_SECOND * (pixels / referencePixels))
+  return Math.min(25_000_000, Math.max(8_000_000, scaled))
+}
 
 const RECORDER_MIME_CANDIDATES = [
   'video/webm;codecs=vp9,opus',
@@ -26,10 +33,17 @@ export function getRecorderMimeType(): string {
   )
 }
 
-export function getRecorderOptions(mimeType = getRecorderMimeType()): MediaRecorderOptions {
+export function getRecorderOptions(
+  mimeType = getRecorderMimeType(),
+  dimensions?: { width: number; height: number },
+): MediaRecorderOptions {
+  const videoBitsPerSecond = dimensions
+    ? videoBitsPerSecondForDimensions(dimensions.width, dimensions.height)
+    : YOUTUBE_VIDEO_BITS_PER_SECOND
+
   return {
     mimeType,
-    videoBitsPerSecond: YOUTUBE_VIDEO_BITS_PER_SECOND,
+    videoBitsPerSecond,
     audioBitsPerSecond: YOUTUBE_AUDIO_BITS_PER_SECOND,
   }
 }

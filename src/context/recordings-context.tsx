@@ -6,6 +6,7 @@ import {
   type UpdateStoredRecordingPatch,
 } from '@/lib/recording-storage'
 import type { Recording } from '@/types/recording'
+import type { ContentTypeId, SessionYouTubeMetadata } from '@/types/session'
 import {
   createContext,
   useCallback,
@@ -29,6 +30,9 @@ interface RecordingsContextValue {
     thumbnailBlob: Blob
     mimeType: string
     durationSeconds: number
+    contentTypeId?: ContentTypeId
+    aspectRatio?: string
+    youtubeMetadata?: SessionYouTubeMetadata
   }) => Promise<Recording>
   updateRecording: (id: string, patch: UpdateStoredRecordingPatch) => Promise<Recording | null>
   removeRecording: (id: string) => Promise<boolean>
@@ -68,6 +72,9 @@ export function RecordingsProvider({ children }: { children: ReactNode }) {
       thumbnailBlob: Blob
       mimeType: string
       durationSeconds: number
+      contentTypeId?: ContentTypeId
+      aspectRatio?: string
+      youtubeMetadata?: SessionYouTubeMetadata
     }) => {
       const recording = await saveDraftRecording(input)
       setRecordings((current) => upsertRecording(current, recording))

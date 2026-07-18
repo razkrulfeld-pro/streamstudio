@@ -1,0 +1,154 @@
+diff --git a/src/components/settings/youtube-settings-section.tsx b/src/components/settings/youtube-settings-section.tsx
+index da00ac6..5a68d7d 100644
+--- a/src/components/settings/youtube-settings-section.tsx
++++ b/src/components/settings/youtube-settings-section.tsx
+@@ -1,32 +1,20 @@
+ import { SettingsSection } from '@/components/settings/settings-section'
+ import { useSettings } from '@/context/settings-context'
+ import { getAuthStatus, getAuthUrl, getChannelInfo, logout } from '@/lib/api'
+ import type { ChannelInfo } from '@/lib/types/youtube'
+ import { cn } from '@/lib/utils'
++import { categoryOptions, visibilityOptions } from '@/lib/youtube-upload-options'
+ import type { YoutubeVisibility } from '@/types/settings'
+ import { CheckCircle2, Loader2, Video } from 'lucide-react'
+ import { useCallback, useEffect, useState } from 'react'
+ 
+-const visibilityOptions: { id: YoutubeVisibility; label: string }[] = [
+-  { id: 'public', label: 'Public' },
+-  { id: 'unlisted', label: 'Unlisted' },
+-  { id: 'private', label: 'Private' },
+-]
+-
+-const categoryOptions = [
+-  { id: '22', label: 'People & Blogs' },
+-  { id: '27', label: 'Education' },
+-  { id: '28', label: 'Science & Technology' },
+-  { id: '24', label: 'Entertainment' },
+-]
+-
+ export function YoutubeSettingsSection() {
+   const { settings, updateYoutube } = useSettings()
+   const youtube = settings.youtube
+   const [connected, setConnected] = useState(false)
+   const [channel, setChannel] = useState<ChannelInfo | null>(null)
+   const [loading, setLoading] = useState(true)
+   const [busy, setBusy] = useState(false)
+   const [error, setError] = useState<string | null>(null)
+ 
+   const refreshStatus = useCallback(async () => {
+diff --git a/src/lib/youtube-upload-options.test.ts b/src/lib/youtube-upload-options.test.ts
+new file mode 100644
+index 0000000..bd8efe1
+--- /dev/null
++++ b/src/lib/youtube-upload-options.test.ts
+@@ -0,0 +1,40 @@
++import assert from 'node:assert/strict'
++import test from 'node:test'
++
++import {
++  formatTagsInput,
++  getCategoryLabel,
++  getCombinedPublishProgress,
++  getVisibilityLabel,
++  parseTagsInput,
++} from './youtube-upload-options.ts'
++
++test('parseTagsInput trims blanks and removes duplicate tags case-insensitively', () => {
++  assert.deepEqual(parseTagsInput('streaming, demo, streaming,  Demo , , youtube'), [
++    'streaming',
++    'demo',
++    'youtube',
++  ])
++})
++
++test('formatTagsInput joins tags for the editable text field', () => {
++  assert.equal(formatTagsInput(['streaming', 'demo', 'youtube']), 'streaming, demo, youtube')
++})
++
++test('getCombinedPublishProgress maps export to the first 35 percent', () => {
++  assert.equal(getCombinedPublishProgress('idle', 0, 0), 0)
++  assert.equal(getCombinedPublishProgress('exporting', 50, 0), 18)
++  assert.equal(getCombinedPublishProgress('exporting', 100, 0), 35)
++})
++
++test('getCombinedPublishProgress maps upload to the remaining 65 percent', () => {
++  assert.equal(getCombinedPublishProgress('uploading', 0, 0), 35)
++  assert.equal(getCombinedPublishProgress('uploading', 0, 50), 68)
++  assert.equal(getCombinedPublishProgress('uploading', 100, 100), 100)
++})
++
++test('labels fall back gracefully for unknown category ids', () => {
++  assert.equal(getVisibilityLabel('unlisted'), 'Unlisted')
++  assert.equal(getCategoryLabel('22'), 'People & Blogs')
++  assert.equal(getCategoryLabel('999'), 'Category 999')
++})
+diff --git a/src/lib/youtube-upload-options.ts b/src/lib/youtube-upload-options.ts
+new file mode 100644
+index 0000000..323644e
+--- /dev/null
++++ b/src/lib/youtube-upload-options.ts
+@@ -0,0 +1,64 @@
++import type { YoutubeVisibility } from '@/types/settings'
++
++export const visibilityOptions: { id: YoutubeVisibility; label: string }[] = [
++  { id: 'public', label: 'Public' },
++  { id: 'unlisted', label: 'Unlisted' },
++  { id: 'private', label: 'Private' },
++]
++
++export const categoryOptions = [
++  { id: '22', label: 'People & Blogs' },
++  { id: '27', label: 'Education' },
++  { id: '28', label: 'Science & Technology' },
++  { id: '24', label: 'Entertainment' },
++]
++
++export type PublishPhase = 'idle' | 'exporting' | 'uploading'
++
++function clampProgress(value: number): number {
++  if (!Number.isFinite(value)) return 0
++  return Math.min(100, Math.max(0, value))
++}
++
++export function getVisibilityLabel(value: YoutubeVisibility): string {
++  return visibilityOptions.find((option) => option.id === value)?.label ?? value
++}
++
++export function getCategoryLabel(categoryId: string): string {
++  return categoryOptions.find((option) => option.id === categoryId)?.label ?? `Category ${categoryId}`
++}
++
++export function parseTagsInput(value: string): string[] {
++  const seen = new Set<string>()
++  const tags: string[] = []
++
++  for (const rawTag of value.split(',')) {
++    const tag = rawTag.trim()
++    const key = tag.toLocaleLowerCase()
++    if (!tag || seen.has(key)) continue
++    seen.add(key)
++    tags.push(tag)
++  }
++
++  return tags
++}
++
++export function formatTagsInput(tags: string[]): string {
++  return tags.join(', ')
++}
++
++export function getCombinedPublishProgress(
++  phase: PublishPhase,
++  exportProgress: number,
++  uploadProgress: number,
++): number {
++  if (phase === 'exporting') {
++    return Math.round(clampProgress(exportProgress) * 0.35)
++  }
++
++  if (phase === 'uploading') {
++    return Math.round(35 + clampProgress(uploadProgress) * 0.65)
++  }
++
++  return 0
++}

@@ -25,6 +25,7 @@ interface RecordingControlBarProps {
   isRecording: boolean
   isSaving: boolean
   elapsedSeconds: number
+  maxDurationSeconds?: number | null
   activePanel: ActivePanel
   visible: boolean
   onToggleCamera: () => void
@@ -129,6 +130,7 @@ export function RecordingControlBar({
   isRecording,
   isSaving,
   elapsedSeconds,
+  maxDurationSeconds = null,
   activePanel,
   visible,
   onToggleCamera,
@@ -142,6 +144,11 @@ export function RecordingControlBar({
   onStopRecording,
   onReveal,
 }: RecordingControlBarProps) {
+  const timerLabel =
+    maxDurationSeconds != null
+      ? `${formatDuration(elapsedSeconds)} / ${formatDuration(maxDurationSeconds)}`
+      : formatDuration(elapsedSeconds)
+
   return (
     <div
       onMouseEnter={onReveal}
@@ -220,7 +227,7 @@ export function RecordingControlBar({
           className="inline-flex items-center gap-2 rounded-full bg-red-600/95 px-5 py-2.5 text-sm font-semibold text-white shadow-lg backdrop-blur-sm transition hover:bg-red-700 disabled:opacity-60"
         >
           <Square className="size-4 fill-current" />
-          {isSaving ? 'Saving draft…' : `Stop · ${formatDuration(elapsedSeconds)}`}
+          {isSaving ? 'Saving draft…' : `Stop · ${timerLabel}`}
         </button>
       ) : (
         <button
