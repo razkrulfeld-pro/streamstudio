@@ -146,11 +146,10 @@ def test_resolve_scrcpy_headless_flags_falls_back_to_no_display():
         assert resolve_scrcpy_headless_flags("/opt/homebrew/bin/scrcpy") == ["--no-display"]
 
 
-def test_scrcpy_cmd_records_to_fifo_path_not_dash():
+def test_scrcpy_cmd_records_to_dev_stdout_not_dash_or_file():
     cmd = build_scrcpy_cmd(
         "/opt/homebrew/bin/scrcpy",
         "10.100.102.6:37487",
-        "/tmp/mirror.mkv",
         headless_flags=["--no-window", "--no-playback"],
     )
     assert cmd[0].endswith("scrcpy")
@@ -158,18 +157,20 @@ def test_scrcpy_cmd_records_to_fifo_path_not_dash():
     assert cmd[serial_idx + 1] == "10.100.102.6:37487"
     assert "--no-window" in cmd
     assert "--no-playback" in cmd
-    assert "--record=/tmp/mirror.mkv" in cmd
+    assert "--record=/dev/stdout" in cmd
     assert "--record=-" not in cmd
+    assert not any(a.startswith("--record=mirror") for a in cmd)
     assert "--max-size=1080" in cmd
     assert any("8M" in a for a in cmd)
 
 
-def test_ffmpeg_cmd_reads_fifo_and_outputs_fragmented_mp4():
-    cmd = build_ffmpeg_cmd("/opt/homebrew/bin/ffmpeg", "/tmp/mirror.mkv")
+def test_ffmpeg_cmd_remuxes_stdin_to_fragmented_mp4_stdout():
+    cmd = build_ffmpeg_cmd("/opt/homebrew/bin/ffmpeg")
     joined = " ".join(cmd)
-    assert "/tmp/mirror.mkv" in cmd
+    assert "pipe:0" in cmd
+    assert "pipe:1" in cmd
     assert "frag_keyframe" in joined
     assert "empty_moov" in joined
+    assert "default_base_moof" in joined
     assert "-f" in cmd
     assert "mp4" in cmd
-    assert "pipe:1" in cmd
