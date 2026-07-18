@@ -96,5 +96,9 @@ export function disconnectDevice(): Promise<{ ok: boolean }> {
 }
 
 export function deviceStreamUrl(): string {
-  return `${apiBaseUrl()}/api/device/stream`
+  // Prefer same-origin via the Vite /api proxy so <video> + captureStream
+  // stay first-party. Fall back to absolute API host when configured.
+  const configured = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.trim()
+  if (configured) return `${configured.replace(/\/$/, '')}/api/device/stream`
+  return '/api/device/stream'
 }
