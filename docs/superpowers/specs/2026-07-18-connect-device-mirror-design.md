@@ -6,11 +6,12 @@
 
 ## Goal
 
-Add a **Connect Device** source option alongside screen share in the studio recorder. When selected, the app scans the local network for an Android device with ADB TCP open on port `5555`, connects, and mirrors the phone into the existing recorder frame with no visible scrcpy UI. Phone video and audio feed the same compositor and screen-audio path used by screen share today.
+Add a **Connect Device** source option alongside screen share in the studio recorder. When selected, the app uses a phone already listed by `adb devices` (Wireless debugging paired, or USB), and mirrors it into the existing recorder frame with no visible scrcpy UI. Phone video and audio feed the same compositor and screen-audio path used by screen share today.
 
 ## Non-goals
 
-- USB-only ADB (wireless TCP `:5555` is required)
+- LAN port scanning for random Wireless debugging ports (Android 11+ often uses a non-5555 port)
+- Pairing / QR pairing UI inside the app (pair once via system Wireless debugging + `adb pair` / USB authorize)
 - Multiple simultaneous device sessions
 - Touch / keyboard injection or remote control of the phone
 - A Node.js sidecar or Electron shell (Python FastAPI `subprocess` only)
@@ -22,6 +23,7 @@ Add a **Connect Device** source option alongside screen share in the studio reco
 | Topic | Choice |
 | --- | --- |
 | Runtime | Extend FastAPI with `subprocess` for `adb`, `scrcpy`, `ffmpeg` (Homebrew on PATH) |
+| Discovery | Read `adb devices`; prefer a network serial (`host:port`); else first ready USB/emulator device. No LAN scan. |
 | Source model | Mutually exclusive with screen share; same screen layer / compositor path |
 | Transport | scrcpy → ffmpeg → live fragmented MP4 over HTTP; play in existing screen `<video>`; `captureStream()` for `MediaStream` |
 | Audio | Device audio via scrcpy, routed through existing screen-share audio path (monitor + record) |
@@ -30,11 +32,10 @@ Add a **Connect Device** source option alongside screen share in the studio reco
 ## Architecture
 
 ```
-Phone (ADB TCP :5555)
-        │  adb connect
+Phone already in `adb devices` (wireless host:port or USB)
         ▼
 FastAPI device service
-  ├── scan LAN :5555
+  ├── adb devices → pick serial
   ├── scrcpy --no-playback --max-size 1080 --video-bit-rate 8M (+ audio)
   └── ffmpeg → live fragmented MP4 (stdout)
         │  GET /api/device/stream
@@ -48,6 +49,7 @@ existing canvas compositor + MediaRecorder
 - Single in-memory device session on the backend (one active pipeline at a time).
 - scrcpy runs headless (`--no-playback` / equivalent no-display flag); never opens a window.
 - Frontend never shells out; it only calls REST endpoints and consumes the stream URL.
+- Stopping the mirror does not `adb disconnect` — pairing stays intact.
 
 ## UI
 
@@ -90,7 +92,7 @@ New FastAPI router under `/api/device`:
 
 | Endpoint | Role |
 | --- | --- |
-| `POST /api/device/connect` | Start scan → `adb connect` → launch scrcpy + ffmpeg. Idempotent if already searching/connecting/connected. |
+| `POST /api/device/connect` | List `adb devices` → pick serial → launch scrcpy + ffmpeg. Idempotent if already searching/connecting/connected. |
 | `GET /api/device/status` | `{ state, deviceAddress?, message?, error? }` |
 | `GET /api/device/stream` | Live fragmented MP4 (video + audio). Valid only when `state === connected`. |
 | `POST /api/device/disconnect` | Kill processes, `adb disconnect`, reset to `idle`. |
@@ -102,8 +104,8 @@ New FastAPI router under `/api/device`:
 ### Process pipeline
 
 1. Resolve `adb`, `scrcpy`, and `ffmpeg` from `PATH` (Homebrew).
-2. Discover local IPv4 subnet (/24) and probe TCP port `5555` with a short per-host timeout; first open port wins.
-3. `adb connect <ip>:5555` and wait until the device appears in `adb devices`.
+2. Run `adb devices` and pick a ready serial (`device` state). Prefer a network serial (`host:port`, including Android 11+ random ports); otherwise use the first USB/emulator device.
+3. Do **not** LAN-scan or call `adb connect` — the phone must already be paired/authorized so it appears in `adb devices`.
 4. Start scrcpy with at least:
    - `--no-playback` (no window)
    - `--max-size=1080`
@@ -128,7 +130,7 @@ Always show a clear friendly message and a **Retry** button that calls connect a
 
 | Condition | Message direction |
 | --- | --- |
-| No host with `:5555` open | Couldn’t find a phone on your network. Make sure Wireless debugging is on and try again. |
+| No ready device in `adb devices` | Couldn’t find a connected phone. Pair it with Wireless debugging (or plug in USB), then try again. |
 | `adb` / `scrcpy` / `ffmpeg` missing from PATH | Device tools aren’t available on this Mac. Install adb, scrcpy, and ffmpeg (Homebrew), then retry. |
 | `adb connect` or pipeline fails to start | Couldn’t connect to your phone. Check that it’s unlocked and on the same Wi‑Fi, then retry. |
 | Stream or processes die mid-session | Connection lost. Retry to reconnect. Tear down backend processes, set `error`, clear the video layer. |
@@ -141,10 +143,10 @@ Always show a clear friendly message and a **Retry** button that calls connect a
 
 - Unit-test status state machine transitions (idle → searching → found → connecting → connected / error) with mocked subprocesses.
 - Unit-test “tools missing” and “no device found” map to the friendly error messages.
-- Manual: phone on same LAN with wireless debugging (`5555`), connect from studio, confirm no scrcpy window, mirror fills frame, rotation updates layout, device audio audible when screen audio is on and present in the recording, Retry recovers from unplug/disconnect, Share screen and Connect Device replace each other cleanly.
+- Manual: phone already listed in `adb devices` (wireless pair or USB), connect from studio, confirm no scrcpy window, mirror fills frame, rotation updates layout, device audio audible when screen audio is on and present in the recording, Retry recovers from unplug/disconnect, Share screen and Connect Device replace each other cleanly.
 
 ## Open implementation notes
 
 - Prefer `--no-playback` on modern scrcpy; fall back to the no-display flag name used by the installed Homebrew build if needed.
 - If a browser cannot play the live fMP4 URL via `src` alone, use Media Source Extensions against the same HTTP stream without changing the overall architecture.
-- LAN scan should bound total time (e.g. a few seconds) so the UI does not hang in Searching indefinitely before moving to Error.
+- Stopping the mirror tears down scrcpy/ffmpeg only; it does not `adb disconnect`.

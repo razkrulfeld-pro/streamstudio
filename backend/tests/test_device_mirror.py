@@ -5,8 +5,9 @@ from app.device_mirror import (
     DeviceMirrorSession,
     build_ffmpeg_cmd,
     build_scrcpy_cmd,
+    list_ready_adb_devices,
+    pick_adb_device,
     resolve_tools,
-    scan_for_adb_device,
 )
 
 
@@ -61,24 +62,41 @@ def test_resolve_tools_returns_paths_when_all_present():
         }
 
 
-def test_scan_returns_first_open_port(monkeypatch):
-    monkeypatch.setattr("app.device_mirror._local_ipv4", lambda: "192.168.1.10")
+def test_list_ready_adb_devices_parses_device_lines():
+    output = (
+        "List of devices attached\n"
+        "192.168.1.50:37123\tdevice\n"
+        "R58M123\toffline\n"
+        "emulator-5554\tdevice\n"
+        "ABC\tunauthorized\n"
+    )
+    with patch("app.device_mirror.subprocess.run") as run:
+        run.return_value.stdout = output
+        run.return_value.returncode = 0
+        assert list_ready_adb_devices("/opt/homebrew/bin/adb") == [
+            "192.168.1.50:37123",
+            "emulator-5554",
+        ]
 
-    def fake_probe(ip, port, timeout):
-        return ip == "192.168.1.50" and port == 5555
 
-    monkeypatch.setattr("app.device_mirror._probe_tcp", fake_probe)
-    assert scan_for_adb_device(timeout_s=2.0) == "192.168.1.50:5555"
+def test_list_ready_adb_devices_empty_when_none():
+    with patch("app.device_mirror.subprocess.run") as run:
+        run.return_value.stdout = "List of devices attached\n\n"
+        run.return_value.returncode = 0
+        assert list_ready_adb_devices("/opt/homebrew/bin/adb") == []
 
 
-def test_scan_returns_none_when_nothing_open(monkeypatch):
-    monkeypatch.setattr("app.device_mirror._local_ipv4", lambda: "192.168.1.10")
-    monkeypatch.setattr("app.device_mirror._probe_tcp", lambda *a, **k: False)
-    assert scan_for_adb_device(timeout_s=1.0) is None
+def test_pick_adb_device_prefers_network_serial():
+    assert pick_adb_device(["R58M123", "192.168.1.50:37123", "emulator-5554"]) == "192.168.1.50:37123"
+
+
+def test_pick_adb_device_falls_back_to_first():
+    assert pick_adb_device(["R58M123", "emulator-5554"]) == "R58M123"
+    assert pick_adb_device([]) is None
 
 
 def test_scrcpy_cmd_is_headless_1080_8m():
-    cmd = build_scrcpy_cmd("/opt/homebrew/bin/scrcpy", "192.168.1.50:5555")
+    cmd = build_scrcpy_cmd("/opt/homebrew/bin/scrcpy", "192.168.1.50:37123")
     assert cmd[0].endswith("scrcpy")
     assert "--no-playback" in cmd
     assert "--max-size=1080" in cmd

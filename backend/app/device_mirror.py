@@ -2,11 +2,9 @@ from __future__ import annotations
 
 import logging
 import shutil
-import socket
 import subprocess
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Iterator, Literal, TypedDict
 
 logger = logging.getLogger(__name__)
@@ -15,8 +13,8 @@ DeviceState = Literal["idle", "searching", "found", "connecting", "connected", "
 
 FRIENDLY_ERRORS = {
     "not_found": (
-        "Couldn't find a phone on your network. "
-        "Make sure Wireless debugging is on and try again."
+        "Couldn't find a connected phone. "
+        "Pair it with Wireless debugging (or plug in USB), then try again."
     ),
     "tools_missing": (
         "Device tools aren't available on this Mac. "
@@ -24,19 +22,16 @@ FRIENDLY_ERRORS = {
     ),
     "connect_failed": (
         "Couldn't connect to your phone. "
-        "Check that it's unlocked and on the same Wi‑Fi, then retry."
+        "Check that it's unlocked and authorized on this Mac, then retry."
     ),
     "connection_lost": "Connection lost. Retry to reconnect.",
 }
 
 STATUS_MESSAGES = {
-    "searching": "Looking for your phone on the local network…",
+    "searching": "Looking for your phone…",
     "found": "Phone found. Connecting…",
     "connecting": "Starting mirror…",
 }
-
-ADB_PORT = 5555
-SCAN_WORKERS = 64
 
 
 class DeviceStatus(TypedDict):
@@ -56,119 +51,39 @@ def resolve_tools() -> dict[str, str] | None:
     return paths
 
 
-def _local_ipv4() -> str | None:
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            sock.connect(("8.8.8.8", 80))
-            ip = sock.getsockname()[0]
-    except OSError:
-        return None
-    if ip.startswith("127."):
-        return None
-    return ip
-
-
-def _probe_tcp(ip: str, port: int, timeout: float) -> bool:
-    try:
-        with socket.create_connection((ip, port), timeout=timeout):
-            return True
-    except OSError:
-        return False
-
-
-def scan_for_adb_device(timeout_s: float = 5.0) -> str | None:
-    local_ip = _local_ipv4()
-    if not local_ip:
-        return None
-
-    parts = local_ip.split(".")
-    if len(parts) != 4:
-        return None
-    prefix = ".".join(parts[:3])
-    hosts = [f"{prefix}.{i}" for i in range(1, 255) if f"{prefix}.{i}" != local_ip]
-
-    deadline = time.monotonic() + timeout_s
-    per_host_timeout = min(0.35, max(0.1, timeout_s / 8))
-    found: str | None = None
-    found_lock = threading.Lock()
-
-    def check(ip: str) -> str | None:
-        if time.monotonic() > deadline:
-            return None
-        if _probe_tcp(ip, ADB_PORT, per_host_timeout):
-            return f"{ip}:{ADB_PORT}"
-        return None
-
-    with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as pool:
-        futures = [pool.submit(check, ip) for ip in hosts]
-        for future in as_completed(futures):
-            if time.monotonic() > deadline:
-                break
-            try:
-                result = future.result()
-            except Exception:
-                continue
-            if result:
-                with found_lock:
-                    if found is None:
-                        found = result
-                break
-
-    return found
-
-
-def adb_connect(adb: str, address: str, timeout_s: float = 10.0) -> bool:
+def list_ready_adb_devices(adb: str, timeout_s: float = 10.0) -> list[str]:
+    """Return serials currently listed as `device` by `adb devices`."""
     try:
         result = subprocess.run(
-            [adb, "connect", address],
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        logger.warning("adb connect failed: %s", exc)
-        return False
-
-    output = f"{result.stdout}\n{result.stderr}".lower()
-    if "connected" not in output and "already connected" not in output:
-        logger.warning("adb connect unexpected output: %s", output.strip())
-        # Still check devices list — some builds are terse.
-
-    try:
-        devices = subprocess.run(
             [adb, "devices"],
             capture_output=True,
             text=True,
             timeout=timeout_s,
             check=False,
         )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.warning("adb devices failed: %s", exc)
+        return []
 
-    for line in devices.stdout.splitlines():
+    serials: list[str] = []
+    for line in result.stdout.splitlines():
         line = line.strip()
         if not line or line.startswith("List"):
             continue
         parts = line.split()
-        if len(parts) >= 2 and parts[0] == address and parts[1] == "device":
-            return True
-    return False
+        if len(parts) >= 2 and parts[1] == "device":
+            serials.append(parts[0])
+    return serials
 
 
-def adb_disconnect(adb: str, address: str | None) -> None:
-    if not address:
-        return
-    try:
-        subprocess.run(
-            [adb, "disconnect", address],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        logger.warning("adb disconnect failed: %s", exc)
+def pick_adb_device(serials: list[str]) -> str | None:
+    """Prefer a network serial (host:port); otherwise the first ready device."""
+    if not serials:
+        return None
+    for serial in serials:
+        if ":" in serial and not serial.startswith("emulator-"):
+            return serial
+    return serials[0]
 
 
 def build_scrcpy_cmd(scrcpy: str, serial: str, *, bit_rate_flag: str = "--video-bit-rate=8M") -> list[str]:
@@ -275,9 +190,10 @@ class DeviceMirrorSession:
                 self.set_error("tools_missing")
                 return
 
-            address = scan_for_adb_device(timeout_s=5.0)
+            serials = list_ready_adb_devices(tools["adb"])
             if self._stopping:
                 return
+            address = pick_adb_device(serials)
             if address is None:
                 self.set_error("not_found")
                 return
@@ -292,10 +208,6 @@ class DeviceMirrorSession:
                 device_address=address,
                 message=STATUS_MESSAGES["connecting"],
             )
-
-            if not adb_connect(tools["adb"], address):
-                self.set_error("connect_failed")
-                return
 
             with self._lock:
                 self._tools = tools
@@ -432,14 +344,8 @@ class DeviceMirrorSession:
 
     def disconnect(self) -> None:
         self._stopping = True
-        tools = None
-        address = None
-        with self._lock:
-            tools = self._tools
-            address = self._device_address
+        # Do not `adb disconnect` — we reuse whatever device was already paired.
         self._teardown_procs()
-        if tools:
-            adb_disconnect(tools["adb"], address)
         self.reset_to_idle()
         self._stopping = False
 
