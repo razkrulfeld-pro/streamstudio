@@ -13,6 +13,7 @@ from app.config import get_settings
 from app.extract import ExtractError, extract_youtube_audio
 from app.models import ErrorBody, ExtractRequest, ExtractResponse
 from app.routers import auth as auth_router
+from app.routers import device as device_router
 from app.routers import youtube as youtube_router
 from app.storage import LocalTempStorage, create_storage
 from app.youtube_urls import is_allowed_youtube_url
@@ -47,6 +48,7 @@ app.add_middleware(
 
 app.include_router(auth_router.router)
 app.include_router(youtube_router.router)
+app.include_router(device_router.router)
 
 _rate_lock = Lock()
 _rate_hits: dict[str, deque[float]] = defaultdict(deque)
