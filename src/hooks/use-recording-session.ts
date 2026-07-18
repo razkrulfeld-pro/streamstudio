@@ -654,7 +654,23 @@ export function useRecordingSession(options?: {
 
     video.srcObject = null
     video.crossOrigin = 'anonymous'
+    video.preload = 'auto'
     video.src = deviceStreamUrl()
+
+    await new Promise<void>((resolve) => {
+      const done = () => {
+        video.removeEventListener('loadeddata', done)
+        video.removeEventListener('error', done)
+        resolve()
+      }
+      if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+        resolve()
+        return
+      }
+      video.addEventListener('loadeddata', done)
+      video.addEventListener('error', done)
+    })
+
     await video.play().catch(() => undefined)
 
     const media = video as HTMLVideoElement & { captureStream(): MediaStream }
@@ -693,6 +709,7 @@ export function useRecordingSession(options?: {
       return
     }
 
+    let attachStarted = false
     devicePollRef.current = setInterval(() => {
       void (async () => {
         try {
@@ -703,6 +720,8 @@ export function useRecordingSession(options?: {
 
           if (status.state === 'connected') {
             clearDevicePoll()
+            if (attachStarted) return
+            attachStarted = true
             await attachDeviceStream()
           } else if (status.state === 'error' || status.state === 'idle') {
             clearDevicePoll()

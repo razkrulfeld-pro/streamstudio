@@ -34,4 +34,12 @@ def stream() -> StreamingResponse:
             status_code=409,
             detail={"error": "Device is not connected.", "code": "not_connected"},
         )
-    return StreamingResponse(session.iter_stream(), media_type="video/mp4")
+    return StreamingResponse(
+        session.iter_stream(),
+        media_type="video/mp4",
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate",
+            "Pragma": "no-cache",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )

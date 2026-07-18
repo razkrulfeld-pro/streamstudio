@@ -74,6 +74,9 @@ export default defineConfig({
       '/api': {
         target: 'http://127.0.0.1:8080',
         changeOrigin: true,
+        // Live device fMP4 must not be buffered by the proxy.
+        timeout: 0,
+        proxyTimeout: 0,
       },
       '/media': {
         target: 'http://127.0.0.1:8080',
