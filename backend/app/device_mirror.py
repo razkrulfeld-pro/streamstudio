@@ -4,7 +4,9 @@ import logging
 import os
 import queue
 import re
+import shlex
 import shutil
+import signal
 import subprocess
 import tempfile
 import threading
@@ -225,6 +227,32 @@ def build_scrcpy_cmd(
     ]
 
 
+def write_scrcpy_launch_script(scrcpy_cmd: list[str], record_dir: str) -> tuple[str, str, str]:
+    """Write an executable ``.command`` that runs scrcpy in Terminal.app.
+
+    Returns ``(script_path, pid_path, log_path)``. The script writes its PID
+    (preserved across ``exec``) so uvicorn can track/kill the GUI-launched process.
+    """
+    script_path = os.path.join(record_dir, "run-scrcpy.command")
+    pid_path = os.path.join(record_dir, "scrcpy.pid")
+    log_path = os.path.join(record_dir, "scrcpy.log")
+    quoted = " ".join(shlex.quote(part) for part in scrcpy_cmd)
+    body = (
+        "#!/bin/bash\n"
+        f"echo $$ > {shlex.quote(pid_path)}\n"
+        f"exec {quoted} >{shlex.quote(log_path)} 2>&1\n"
+    )
+    with open(script_path, "w", encoding="utf-8") as fh:
+        fh.write(body)
+    os.chmod(script_path, 0o755)
+    return script_path, pid_path, log_path
+
+
+def build_open_terminal_cmd(script_path: str) -> list[str]:
+    """Launch a shell script inside Terminal.app (real macOS GUI / Metal context)."""
+    return ["open", "-a", "Terminal.app", script_path]
+
+
 def build_tail_cmd(record_path: str) -> list[str]:
     """Follow a growing scrcpy record file from byte 0 (macOS ``tail -F``)."""
     return ["tail", "-c", "+0", "-F", record_path]
@@ -439,7 +467,7 @@ class DeviceMirrorSession:
         self._message: str | None = None
         self._error: str | None = None
         self._tools: dict[str, str] | None = None
-        self._scrcpy_proc: subprocess.Popen[bytes] | None = None
+        self._scrcpy_pid: int | None = None
         self._tail_proc: subprocess.Popen[bytes] | None = None
         self._ffmpeg_proc: subprocess.Popen[bytes] | None = None
         self._broadcast: Fmp4Broadcast | None = None
@@ -552,56 +580,60 @@ class DeviceMirrorSession:
             return
 
         scrcpy_cmd = build_scrcpy_cmd(tools["scrcpy"], address, record_path=record_path)
-        tail_cmd = build_tail_cmd(record_path)
-        ffmpeg_cmd = build_ffmpeg_cmd(tools["ffmpeg"])
-        logger.info(
-            "Starting mirror pipeline via file-tail %s: %s | %s | %s",
-            record_path,
-            " ".join(scrcpy_cmd),
-            " ".join(tail_cmd),
-            " ".join(ffmpeg_cmd),
-        )
-
-        # File-tail handshake: start scrcpy first so it owns a real window/Metal
-        # context and appends Matroska to disk. Once the file has bytes, start
-        # tail -F → ffmpeg so the demuxer never sees premature EOF between flushes.
         try:
-            scrcpy_proc = subprocess.Popen(
-                scrcpy_cmd,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-            )
-        except OSError:
-            scrcpy_cmd = build_scrcpy_cmd(
-                tools["scrcpy"],
-                address,
-                bit_rate_flag="--bit-rate=8M",
-                record_path=record_path,
-            )
-            try:
-                scrcpy_proc = subprocess.Popen(
-                    scrcpy_cmd,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.PIPE,
-                )
-            except OSError as exc:
-                logger.warning("Failed to start scrcpy: %s", exc)
-                self._cleanup_record(record_path, record_dir)
-                self.set_error("connect_failed")
-                return
-
-        _spawn_stderr_logger(scrcpy_proc, "scrcpy")
-
-        if not self._wait_for_record_bytes(record_path, scrcpy_proc, timeout_s=15.0, min_bytes=64 * 1024):
-            logger.warning("Timed out waiting for scrcpy to write record file %s", record_path)
-            self._kill_procs(scrcpy_proc, None, None)
+            script_path, pid_path, log_path = write_scrcpy_launch_script(scrcpy_cmd, record_dir)
+        except OSError as exc:
+            logger.warning("Failed to write scrcpy launch script: %s", exc)
             self._cleanup_record(record_path, record_dir)
             self.set_error("connect_failed")
             return
 
-        logger.info("scrcpy is writing %s; starting tail → ffmpeg", record_path)
+        open_cmd = build_open_terminal_cmd(script_path)
+        tail_cmd = build_tail_cmd(record_path)
+        ffmpeg_cmd = build_ffmpeg_cmd(tools["ffmpeg"])
+        logger.info(
+            "Starting mirror pipeline via Terminal.app + file-tail %s: %s | %s | %s",
+            record_path,
+            " ".join(open_cmd),
+            " ".join(tail_cmd),
+            " ".join(ffmpeg_cmd),
+        )
+
+        # Launch scrcpy inside Terminal.app so Metal gets a real macOS GUI session.
+        # uvicorn's process tree has no foreground app context; open(1) does.
+        try:
+            opened = subprocess.run(open_cmd, capture_output=True, text=True, timeout=10, check=False)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            logger.warning("Failed to open Terminal.app for scrcpy: %s", exc)
+            self._cleanup_record(record_path, record_dir)
+            self.set_error("connect_failed")
+            return
+        if opened.returncode != 0:
+            logger.warning(
+                "open -a Terminal.app failed (rc=%s): %s",
+                opened.returncode,
+                (opened.stderr or opened.stdout or "").strip(),
+            )
+            self._cleanup_record(record_path, record_dir)
+            self.set_error("connect_failed")
+            return
+
+        scrcpy_pid = self._wait_for_scrcpy_pid(pid_path, timeout_s=10.0)
+        if scrcpy_pid is None:
+            logger.warning("Timed out waiting for scrcpy pid file %s; log=%s", pid_path, log_path)
+            self._cleanup_record(record_path, record_dir)
+            self.set_error("connect_failed")
+            return
+
+        if not self._wait_for_record_bytes(record_path, scrcpy_pid, timeout_s=20.0, min_bytes=64 * 1024):
+            logger.warning("Timed out waiting for scrcpy to write record file %s", record_path)
+            self._spill_scrcpy_log(log_path)
+            self._kill_scrcpy_pid(scrcpy_pid)
+            self._cleanup_record(record_path, record_dir)
+            self.set_error("connect_failed")
+            return
+
+        logger.info("scrcpy pid=%s is writing %s; starting tail → ffmpeg", scrcpy_pid, record_path)
 
         try:
             tail_proc = subprocess.Popen(
@@ -612,7 +644,7 @@ class DeviceMirrorSession:
             )
         except OSError as exc:
             logger.warning("Failed to start tail: %s", exc)
-            self._kill_procs(scrcpy_proc, None, None)
+            self._kill_scrcpy_pid(scrcpy_pid)
             self._cleanup_record(record_path, record_dir)
             self.set_error("connect_failed")
             return
@@ -626,7 +658,7 @@ class DeviceMirrorSession:
             )
         except OSError as exc:
             logger.warning("Failed to start ffmpeg: %s", exc)
-            self._kill_procs(scrcpy_proc, tail_proc, None)
+            self._kill_procs(scrcpy_pid, tail_proc, None)
             self._cleanup_record(record_path, record_dir)
             self.set_error("connect_failed")
             return
@@ -638,16 +670,17 @@ class DeviceMirrorSession:
         _spawn_stderr_logger(ffmpeg_proc, "ffmpeg")
 
         time.sleep(0.35)
-        if scrcpy_proc.poll() is not None:
-            logger.warning("scrcpy exited early (rc=%s); see scrcpy stderr logs above", scrcpy_proc.returncode)
-            self._kill_procs(scrcpy_proc, tail_proc, ffmpeg_proc)
+        if not self._pid_alive(scrcpy_pid):
+            logger.warning("scrcpy exited early (pid=%s); see %s", scrcpy_pid, log_path)
+            self._spill_scrcpy_log(log_path)
+            self._kill_procs(scrcpy_pid, tail_proc, ffmpeg_proc)
             self._cleanup_record(record_path, record_dir)
             self.set_error("connect_failed")
             return
 
         if ffmpeg_proc.poll() is not None:
             logger.warning("ffmpeg exited early (rc=%s); see ffmpeg stderr logs above", ffmpeg_proc.returncode)
-            self._kill_procs(scrcpy_proc, tail_proc, ffmpeg_proc)
+            self._kill_procs(scrcpy_pid, tail_proc, ffmpeg_proc)
             self._cleanup_record(record_path, record_dir)
             self.set_error("connect_failed")
             return
@@ -664,13 +697,13 @@ class DeviceMirrorSession:
         if not self._wait_for_media_fragment(broadcast, timeout_s=20.0):
             logger.warning("Timed out waiting for live fMP4 media fragments from ffmpeg")
             broadcast.close()
-            self._kill_procs(scrcpy_proc, tail_proc, ffmpeg_proc)
+            self._kill_procs(scrcpy_pid, tail_proc, ffmpeg_proc)
             self._cleanup_record(record_path, record_dir)
             self.set_error("connect_failed")
             return
 
         with self._lock:
-            self._scrcpy_proc = scrcpy_proc
+            self._scrcpy_pid = scrcpy_pid
             self._tail_proc = tail_proc
             self._ffmpeg_proc = ffmpeg_proc
             self._broadcast = broadcast
@@ -684,9 +717,25 @@ class DeviceMirrorSession:
         watcher.start()
 
     @staticmethod
+    def _wait_for_scrcpy_pid(pid_path: str, timeout_s: float) -> int | None:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            try:
+                with open(pid_path, encoding="utf-8") as fh:
+                    raw = fh.read().strip()
+                if raw:
+                    pid = int(raw)
+                    if DeviceMirrorSession._pid_alive(pid):
+                        return pid
+            except (OSError, ValueError):
+                pass
+            time.sleep(0.1)
+        return None
+
+    @staticmethod
     def _wait_for_record_bytes(
         record_path: str,
-        scrcpy_proc: subprocess.Popen[bytes],
+        scrcpy_pid: int,
         *,
         timeout_s: float,
         min_bytes: int,
@@ -694,7 +743,7 @@ class DeviceMirrorSession:
         """Wait until scrcpy has created and written at least ``min_bytes``."""
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
-            if scrcpy_proc.poll() is not None:
+            if not DeviceMirrorSession._pid_alive(scrcpy_pid):
                 return False
             try:
                 if os.path.exists(record_path) and os.path.getsize(record_path) >= min_bytes:
@@ -753,15 +802,16 @@ class DeviceMirrorSession:
 
     def _watch_procs(self) -> None:
         while not self._stopping:
-            scrcpy = self._scrcpy_proc
+            scrcpy_pid = self._scrcpy_pid
             ffmpeg = self._ffmpeg_proc
-            if scrcpy is None or ffmpeg is None:
+            if scrcpy_pid is None or ffmpeg is None:
                 return
-            if scrcpy.poll() is not None or ffmpeg.poll() is not None:
+            if not self._pid_alive(scrcpy_pid) or ffmpeg.poll() is not None:
                 if not self._stopping:
                     logger.warning(
-                        "Mirror pipeline process exited (scrcpy rc=%s ffmpeg rc=%s)",
-                        scrcpy.poll(),
+                        "Mirror pipeline process exited (scrcpy pid=%s alive=%s ffmpeg rc=%s)",
+                        scrcpy_pid,
+                        self._pid_alive(scrcpy_pid),
                         ffmpeg.poll(),
                     )
                     self._teardown_procs()
@@ -787,13 +837,13 @@ class DeviceMirrorSession:
 
     def _teardown_procs(self) -> None:
         with self._lock:
-            scrcpy = self._scrcpy_proc
+            scrcpy_pid = self._scrcpy_pid
             tail = self._tail_proc
             ffmpeg = self._ffmpeg_proc
             broadcast = self._broadcast
             record_path = self._record_path
             record_dir = self._record_dir
-            self._scrcpy_proc = None
+            self._scrcpy_pid = None
             self._tail_proc = None
             self._ffmpeg_proc = None
             self._broadcast = None
@@ -802,7 +852,7 @@ class DeviceMirrorSession:
             self._record_dir = None
         if broadcast is not None:
             broadcast.close()
-        self._kill_procs(scrcpy, tail, ffmpeg)
+        self._kill_procs(scrcpy_pid, tail, ffmpeg)
         self._cleanup_record(record_path, record_dir)
 
     @staticmethod
@@ -816,12 +866,46 @@ class DeviceMirrorSession:
             shutil.rmtree(record_dir, ignore_errors=True)
 
     @staticmethod
+    def _spill_scrcpy_log(log_path: str) -> None:
+        try:
+            with open(log_path, encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    line = line.rstrip()
+                    if line:
+                        logger.info("scrcpy: %s", line)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _pid_alive(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
+    @staticmethod
+    def _kill_scrcpy_pid(pid: int | None) -> None:
+        if pid is None:
+            return
+        try:
+            if DeviceMirrorSession._pid_alive(pid):
+                os.kill(pid, signal.SIGTERM)
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and DeviceMirrorSession._pid_alive(pid):
+                    time.sleep(0.05)
+                if DeviceMirrorSession._pid_alive(pid):
+                    os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+    @staticmethod
     def _kill_procs(
-        scrcpy: subprocess.Popen[bytes] | None,
+        scrcpy_pid: int | None,
         tail: subprocess.Popen[bytes] | None,
         ffmpeg: subprocess.Popen[bytes] | None,
     ) -> None:
-        for proc in (ffmpeg, tail, scrcpy):
+        for proc in (ffmpeg, tail):
             if proc is None:
                 continue
             try:
@@ -833,3 +917,4 @@ class DeviceMirrorSession:
                         proc.kill()
             except OSError:
                 pass
+        DeviceMirrorSession._kill_scrcpy_pid(scrcpy_pid)

@@ -1,4 +1,5 @@
 import os
+import shutil
 from unittest.mock import patch
 
 from app.device_mirror import (
@@ -6,6 +7,7 @@ from app.device_mirror import (
     DeviceMirrorSession,
     Fmp4Broadcast,
     build_ffmpeg_cmd,
+    build_open_terminal_cmd,
     build_scrcpy_cmd,
     build_tail_cmd,
     create_record_file,
@@ -15,6 +17,7 @@ from app.device_mirror import (
     resolve_scrcpy_headless_flags,
     resolve_scrcpy_video_source_flags,
     resolve_tools,
+    write_scrcpy_launch_script,
 )
 
 
@@ -217,6 +220,40 @@ def test_scrcpy_cmd_records_to_file_not_dev_stdout_or_dash():
     assert not any(a.startswith("--record=mirror") for a in cmd)
     assert "--max-size=1080" in cmd
     assert any("8M" in a for a in cmd)
+
+
+def test_write_scrcpy_launch_script_is_executable_and_writes_pid():
+    import stat
+    import tempfile
+
+    record_dir = tempfile.mkdtemp(prefix="device-mirror-script-test-")
+    try:
+        cmd = [
+            "/opt/homebrew/bin/scrcpy",
+            "--serial",
+            "10.0.0.1:5555",
+            "--record=/tmp/device-mirror-test/record.mkv",
+        ]
+        script_path, pid_path, log_path = write_scrcpy_launch_script(cmd, record_dir)
+        assert script_path.endswith(".command")
+        assert os.path.isfile(script_path)
+        assert os.stat(script_path).st_mode & stat.S_IXUSR
+        body = open(script_path, encoding="utf-8").read()
+        assert body.startswith("#!/bin/bash")
+        assert pid_path in body
+        assert log_path in body
+        assert "/opt/homebrew/bin/scrcpy" in body
+        assert "--record=/tmp/device-mirror-test/record.mkv" in body
+        assert "exec" in body
+    finally:
+        shutil.rmtree(record_dir, ignore_errors=True)
+
+
+def test_build_open_terminal_cmd_uses_terminal_app():
+    script = "/tmp/device-mirror-test/run-scrcpy.command"
+    cmd = build_open_terminal_cmd(script)
+    assert cmd[:3] == ["open", "-a", "Terminal.app"]
+    assert cmd[-1] == script
 
 
 def test_resolve_scrcpy_video_source_flags_uses_display_when_supported():
