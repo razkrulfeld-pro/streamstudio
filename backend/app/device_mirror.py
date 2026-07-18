@@ -11,7 +11,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from typing import Iterator, Literal, TypedDict
+from typing import Callable, Iterator, Literal, TypedDict
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +43,22 @@ STATUS_MESSAGES = {
     "found": "Phone found. Connecting…",
     "connecting": "Starting mirror…",
 }
+
+# Terminal.app launch + Metal init can take well over the old ~20s budget.
+SCRCPY_PID_TIMEOUT_S = 30.0
+RECORD_APPEAR_TIMEOUT_S = 90.0
+RECORD_APPEAR_MIN_BYTES = 1024
+
+
+def is_pipeline_ready_for_stream(*, scrcpy_alive: bool, ffmpeg_alive: bool) -> bool:
+    """Clients may attach once the recorder + remuxer are alive.
+
+    Do **not** require ffmpeg media fragments (``moof``) first. On this Mac,
+    scrcpy Metal/server init often takes longer than any practical fragment
+    wait; aborting on missing media kills a healthy initializing scrcpy
+    (Terminal shows ``zsh: killed``) before video ever flows.
+    """
+    return scrcpy_alive and ffmpeg_alive
 
 
 class DeviceStatus(TypedDict):
@@ -232,15 +248,19 @@ def write_scrcpy_launch_script(scrcpy_cmd: list[str], record_dir: str) -> tuple[
 
     Returns ``(script_path, pid_path, log_path)``. The script writes its PID
     (preserved across ``exec``) so uvicorn can track/kill the GUI-launched process.
+    scrcpy stdout/stderr are redirected to ``scrcpy.log`` in the temp dir for
+    post-mortem inspection (dir is kept until the pipeline fully stops).
     """
     script_path = os.path.join(record_dir, "run-scrcpy.command")
     pid_path = os.path.join(record_dir, "scrcpy.pid")
     log_path = os.path.join(record_dir, "scrcpy.log")
     quoted = " ".join(shlex.quote(part) for part in scrcpy_cmd)
+    quoted_log = shlex.quote(log_path)
     body = (
         "#!/bin/bash\n"
         f"echo $$ > {shlex.quote(pid_path)}\n"
-        f"exec {quoted} >{shlex.quote(log_path)} 2>&1\n"
+        f"echo \"[device-mirror] launching scrcpy at $(date)\" >{quoted_log}\n"
+        f"exec {quoted} >>{quoted_log} 2>&1\n"
     )
     with open(script_path, "w", encoding="utf-8") as fh:
         fh.write(body)
@@ -339,8 +359,8 @@ class Fmp4Broadcast:
     the second connection gets mid-stream ``moof`` bytes and cannot decode.
 
     Until the first subscriber attaches, post-init media is held in a bounded
-    preroll buffer so ``connected`` can wait for real fragments without dropping
-    the burst that proved the pipeline is live.
+    preroll buffer so early ``/stream`` clients still receive the burst that
+    proved the remuxer is live.
     """
 
     _QUEUE_SIZE = 64
@@ -462,6 +482,8 @@ def _spawn_stderr_logger(proc: subprocess.Popen[bytes], label: str) -> threading
 class DeviceMirrorSession:
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        self._connect_mutex = threading.Lock()
+        self._connect_epoch = 0
         self._state: DeviceState = "idle"
         self._device_address: str | None = None
         self._message: str | None = None
@@ -518,54 +540,88 @@ class DeviceMirrorSession:
             self._tools = None
 
     def connect_async(self) -> None:
+        """Start (or restart) a mirror session.
+
+        Concurrent / repeated calls are serialized: any in-flight or running
+        pipeline is torn down before a new one starts, and only the latest
+        connect epoch proceeds. Never runs two pipelines at once.
+        """
         with self._lock:
-            if self._state in ("searching", "found", "connecting", "connected"):
-                return
-            if self._connect_thread and self._connect_thread.is_alive():
-                return
-            self._stopping = False
-            thread = threading.Thread(target=self._connect_worker, name="device-mirror-connect", daemon=True)
+            self._connect_epoch += 1
+            epoch = self._connect_epoch
+            self._stopping = True
+
+        def run() -> None:
+            with self._connect_mutex:
+                with self._lock:
+                    if epoch != self._connect_epoch:
+                        return
+                    self._stopping = False
+                # Always clear any prior pipeline before starting a new one.
+                self._teardown_procs()
+                with self._lock:
+                    if epoch != self._connect_epoch:
+                        return
+                    self._state = "idle"
+                    self._device_address = None
+                    self._message = None
+                    self._error = None
+                    self._tools = None
+                try:
+                    self._connect_worker(epoch)
+                except Exception:
+                    logger.exception("Device connect failed unexpectedly")
+                    if not self._is_stale(epoch):
+                        self.set_error("connect_failed")
+
+        thread = threading.Thread(target=run, name="device-mirror-connect", daemon=True)
+        with self._lock:
             self._connect_thread = thread
         thread.start()
 
-    def _connect_worker(self) -> None:
-        try:
-            self._set_state("searching", message=STATUS_MESSAGES["searching"])
-            tools = resolve_tools()
-            if tools is None:
-                self.set_error("tools_missing")
+    def _connect_worker(self, epoch: int) -> None:
+        if self._is_stale(epoch):
+            return
+        self._set_state("searching", message=STATUS_MESSAGES["searching"])
+        tools = resolve_tools()
+        if tools is None:
+            self.set_error("tools_missing")
+            return
+
+        serials = list_ready_adb_devices(tools["adb"])
+        if self._is_stale(epoch):
+            return
+        address = pick_adb_device(serials)
+        if address is None:
+            self.set_error("not_found")
+            return
+
+        self._set_state(
+            "found",
+            device_address=address,
+            message=STATUS_MESSAGES["found"],
+        )
+        self._set_state(
+            "connecting",
+            device_address=address,
+            message=STATUS_MESSAGES["connecting"],
+        )
+
+        with self._lock:
+            if epoch != self._connect_epoch:
                 return
+            self._tools = tools
+            self._device_address = address
 
-            serials = list_ready_adb_devices(tools["adb"])
-            if self._stopping:
-                return
-            address = pick_adb_device(serials)
-            if address is None:
-                self.set_error("not_found")
-                return
+        self._start_pipeline(epoch)
 
-            self._set_state(
-                "found",
-                device_address=address,
-                message=STATUS_MESSAGES["found"],
-            )
-            self._set_state(
-                "connecting",
-                device_address=address,
-                message=STATUS_MESSAGES["connecting"],
-            )
+    def _is_stale(self, epoch: int) -> bool:
+        with self._lock:
+            return self._stopping or epoch != self._connect_epoch
 
-            with self._lock:
-                self._tools = tools
-                self._device_address = address
-
-            self._start_pipeline()
-        except Exception:
-            logger.exception("Device connect failed unexpectedly")
-            if not self._stopping:
-                self.set_error("connect_failed")
-
-    def _start_pipeline(self) -> None:
+    def _start_pipeline(self, epoch: int) -> None:
+        if self._is_stale(epoch):
+            return
         tools = self._tools
         address = self._device_address
         if not tools or not address:
@@ -579,13 +635,21 @@ class DeviceMirrorSession:
             self.set_error("connect_failed")
             return
 
+        # Bind temp paths immediately so disconnect/teardown can clean them
+        # even if connect aborts mid-wait. Do not rmtree while scrcpy may still
+        # be starting via Terminal.app.
+        with self._lock:
+            if epoch != self._connect_epoch:
+                return
+            self._record_path = record_path
+            self._record_dir = record_dir
+
         scrcpy_cmd = build_scrcpy_cmd(tools["scrcpy"], address, record_path=record_path)
         try:
             script_path, pid_path, log_path = write_scrcpy_launch_script(scrcpy_cmd, record_dir)
         except OSError as exc:
             logger.warning("Failed to write scrcpy launch script: %s", exc)
-            self._cleanup_record(record_path, record_dir)
-            self.set_error("connect_failed")
+            self._abort_start(epoch)
             return
 
         open_cmd = build_open_terminal_cmd(script_path)
@@ -601,12 +665,14 @@ class DeviceMirrorSession:
 
         # Launch scrcpy inside Terminal.app so Metal gets a real macOS GUI session.
         # uvicorn's process tree has no foreground app context; open(1) does.
+        if self._is_stale(epoch):
+            self._abort_start(epoch)
+            return
         try:
             opened = subprocess.run(open_cmd, capture_output=True, text=True, timeout=10, check=False)
         except (OSError, subprocess.TimeoutExpired) as exc:
             logger.warning("Failed to open Terminal.app for scrcpy: %s", exc)
-            self._cleanup_record(record_path, record_dir)
-            self.set_error("connect_failed")
+            self._abort_start(epoch)
             return
         if opened.returncode != 0:
             logger.warning(
@@ -614,23 +680,55 @@ class DeviceMirrorSession:
                 opened.returncode,
                 (opened.stderr or opened.stdout or "").strip(),
             )
-            self._cleanup_record(record_path, record_dir)
-            self.set_error("connect_failed")
+            self._abort_start(epoch)
             return
 
-        scrcpy_pid = self._wait_for_scrcpy_pid(pid_path, timeout_s=10.0)
+        scrcpy_pid = self._wait_for_scrcpy_pid(
+            pid_path,
+            timeout_s=SCRCPY_PID_TIMEOUT_S,
+            should_abort=lambda: self._is_stale(epoch),
+        )
         if scrcpy_pid is None:
+            if self._is_stale(epoch):
+                self._abort_start(epoch)
+                return
             logger.warning("Timed out waiting for scrcpy pid file %s; log=%s", pid_path, log_path)
-            self._cleanup_record(record_path, record_dir)
-            self.set_error("connect_failed")
+            self._spill_scrcpy_log(log_path)
+            self._abort_start(epoch)
             return
 
-        if not self._wait_for_record_bytes(record_path, scrcpy_pid, timeout_s=20.0, min_bytes=64 * 1024):
-            logger.warning("Timed out waiting for scrcpy to write record file %s", record_path)
-            self._spill_scrcpy_log(log_path)
+        if self._is_stale(epoch):
             self._kill_scrcpy_pid(scrcpy_pid)
-            self._cleanup_record(record_path, record_dir)
-            self.set_error("connect_failed")
+            self._abort_start(epoch)
+            return
+
+        with self._lock:
+            if epoch != self._connect_epoch:
+                self._kill_scrcpy_pid(scrcpy_pid)
+                return
+            self._scrcpy_pid = scrcpy_pid
+
+        if not self._wait_for_record_bytes(
+            record_path,
+            scrcpy_pid,
+            timeout_s=RECORD_APPEAR_TIMEOUT_S,
+            min_bytes=RECORD_APPEAR_MIN_BYTES,
+            should_abort=lambda: self._is_stale(epoch),
+        ):
+            if self._is_stale(epoch):
+                self._abort_start(epoch)
+                return
+            logger.warning(
+                "Timed out waiting for scrcpy to write record file %s (waited %.0fs)",
+                record_path,
+                RECORD_APPEAR_TIMEOUT_S,
+            )
+            self._spill_scrcpy_log(log_path)
+            self._abort_start(epoch)
+            return
+
+        if self._is_stale(epoch):
+            self._abort_start(epoch)
             return
 
         logger.info("scrcpy pid=%s is writing %s; starting tail → ffmpeg", scrcpy_pid, record_path)
@@ -644,9 +742,7 @@ class DeviceMirrorSession:
             )
         except OSError as exc:
             logger.warning("Failed to start tail: %s", exc)
-            self._kill_scrcpy_pid(scrcpy_pid)
-            self._cleanup_record(record_path, record_dir)
-            self.set_error("connect_failed")
+            self._abort_start(epoch)
             return
 
         try:
@@ -658,9 +754,9 @@ class DeviceMirrorSession:
             )
         except OSError as exc:
             logger.warning("Failed to start ffmpeg: %s", exc)
-            self._kill_procs(scrcpy_pid, tail_proc, None)
-            self._cleanup_record(record_path, record_dir)
-            self.set_error("connect_failed")
+            with self._lock:
+                self._tail_proc = tail_proc
+            self._abort_start(epoch)
             return
 
         # Allow tail to receive SIGPIPE if ffmpeg exits.
@@ -669,20 +765,26 @@ class DeviceMirrorSession:
 
         _spawn_stderr_logger(ffmpeg_proc, "ffmpeg")
 
+        with self._lock:
+            if epoch != self._connect_epoch:
+                self._kill_procs(scrcpy_pid, tail_proc, ffmpeg_proc)
+                return
+            self._tail_proc = tail_proc
+            self._ffmpeg_proc = ffmpeg_proc
+
         time.sleep(0.35)
+        if self._is_stale(epoch):
+            self._abort_start(epoch)
+            return
         if not self._pid_alive(scrcpy_pid):
             logger.warning("scrcpy exited early (pid=%s); see %s", scrcpy_pid, log_path)
             self._spill_scrcpy_log(log_path)
-            self._kill_procs(scrcpy_pid, tail_proc, ffmpeg_proc)
-            self._cleanup_record(record_path, record_dir)
-            self.set_error("connect_failed")
+            self._abort_start(epoch)
             return
 
         if ffmpeg_proc.poll() is not None:
             logger.warning("ffmpeg exited early (rc=%s); see ffmpeg stderr logs above", ffmpeg_proc.returncode)
-            self._kill_procs(scrcpy_pid, tail_proc, ffmpeg_proc)
-            self._cleanup_record(record_path, record_dir)
-            self.set_error("connect_failed")
+            self._abort_start(epoch)
             return
 
         broadcast = Fmp4Broadcast()
@@ -694,32 +796,57 @@ class DeviceMirrorSession:
         )
         pump.start()
 
-        if not self._wait_for_media_fragment(broadcast, timeout_s=20.0):
-            logger.warning("Timed out waiting for live fMP4 media fragments from ffmpeg")
-            broadcast.close()
-            self._kill_procs(scrcpy_pid, tail_proc, ffmpeg_proc)
-            self._cleanup_record(record_path, record_dir)
-            self.set_error("connect_failed")
-            return
-
         with self._lock:
-            self._scrcpy_pid = scrcpy_pid
-            self._tail_proc = tail_proc
-            self._ffmpeg_proc = ffmpeg_proc
+            if epoch != self._connect_epoch:
+                broadcast.close()
+                self._kill_procs(scrcpy_pid, tail_proc, ffmpeg_proc)
+                return
             self._broadcast = broadcast
             self._pump_thread = pump
-            self._record_path = record_path
-            self._record_dir = record_dir
+
+        # Mark connected as soon as the pipeline is running. Waiting for ffmpeg
+        # media fragments here previously aborted (and killed scrcpy) while
+        # Metal/server init was still in progress — clients attach to /stream
+        # and receive fMP4 naturally as the pump produces it.
+        if not is_pipeline_ready_for_stream(
+            scrcpy_alive=self._pid_alive(scrcpy_pid),
+            ffmpeg_alive=ffmpeg_proc.poll() is None,
+        ):
+            logger.warning(
+                "Pipeline not ready after pump start (scrcpy pid=%s alive=%s ffmpeg rc=%s)",
+                scrcpy_pid,
+                self._pid_alive(scrcpy_pid),
+                ffmpeg_proc.poll(),
+            )
+            self._spill_scrcpy_log(log_path)
+            self._abort_start(epoch)
+            return
+
+        if self._is_stale(epoch):
+            self._abort_start(epoch)
+            return
 
         self._set_state("connected", device_address=address, message=None)
         watcher = threading.Thread(target=self._watch_procs, name="device-mirror-watch", daemon=True)
         self._watcher_thread = watcher
         watcher.start()
 
+    def _abort_start(self, epoch: int | None = None) -> None:
+        """Kill any started procs, then remove the temp dir once the pipeline has stopped."""
+        self._teardown_procs()
+        if epoch is not None and self._is_stale(epoch):
+            return
+        self.set_error("connect_failed")
     @staticmethod
-    def _wait_for_scrcpy_pid(pid_path: str, timeout_s: float) -> int | None:
+    def _wait_for_scrcpy_pid(
+        pid_path: str,
+        timeout_s: float,
+        should_abort: Callable[[], bool] | None = None,
+    ) -> int | None:
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
+            if should_abort and should_abort():
+                return None
             try:
                 with open(pid_path, encoding="utf-8") as fh:
                     raw = fh.read().strip()
@@ -739,10 +866,13 @@ class DeviceMirrorSession:
         *,
         timeout_s: float,
         min_bytes: int,
+        should_abort: Callable[[], bool] | None = None,
     ) -> bool:
         """Wait until scrcpy has created and written at least ``min_bytes``."""
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
+            if should_abort and should_abort():
+                return False
             if not DeviceMirrorSession._pid_alive(scrcpy_pid):
                 return False
             try:
@@ -764,21 +894,6 @@ class DeviceMirrorSession:
                 return True
             time.sleep(0.05)
         return broadcast.init_segment is not None
-
-    @staticmethod
-    def _wait_for_media_fragment(broadcast: Fmp4Broadcast, timeout_s: float) -> bool:
-        """Wait until ffmpeg has emitted at least one post-init media chunk.
-
-        scrcpy flushes the record file in large bursts; init (ftyp+moov) often
-        arrives seconds before the first ``moof``. Marking connected too early
-        leaves the browser attached to an empty stream.
-        """
-        deadline = time.monotonic() + timeout_s
-        while time.monotonic() < deadline:
-            if broadcast.media_seen:
-                return True
-            time.sleep(0.05)
-        return broadcast.media_seen
 
     @staticmethod
     def _pump_ffmpeg_stdout(
@@ -829,7 +944,9 @@ class DeviceMirrorSession:
         yield from broadcast.subscribe()
 
     def disconnect(self) -> None:
-        self._stopping = True
+        with self._lock:
+            self._connect_epoch += 1
+            self._stopping = True
         # Do not `adb disconnect` — we reuse whatever device was already paired.
         self._teardown_procs()
         self.reset_to_idle()

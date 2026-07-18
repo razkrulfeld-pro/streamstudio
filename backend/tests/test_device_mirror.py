@@ -1,9 +1,14 @@
 import os
 import shutil
+import threading
+import time
 from unittest.mock import patch
 
 from app.device_mirror import (
     FRIENDLY_ERRORS,
+    RECORD_APPEAR_MIN_BYTES,
+    RECORD_APPEAR_TIMEOUT_S,
+    SCRCPY_PID_TIMEOUT_S,
     DeviceMirrorSession,
     Fmp4Broadcast,
     build_ffmpeg_cmd,
@@ -12,6 +17,7 @@ from app.device_mirror import (
     build_tail_cmd,
     create_record_file,
     extract_fmp4_init_segment,
+    is_pipeline_ready_for_stream,
     list_ready_adb_devices,
     pick_adb_device,
     resolve_scrcpy_headless_flags,
@@ -222,7 +228,15 @@ def test_scrcpy_cmd_records_to_file_not_dev_stdout_or_dash():
     assert any("8M" in a for a in cmd)
 
 
+def test_record_appear_timeout_gives_terminal_launch_time():
+    """Terminal.app + Metal init is slow; don't give up after a few seconds."""
+    assert RECORD_APPEAR_TIMEOUT_S >= 60.0
+    assert SCRCPY_PID_TIMEOUT_S >= 20.0
+    assert RECORD_APPEAR_MIN_BYTES >= 1
+
+
 def test_write_scrcpy_launch_script_is_executable_and_writes_pid():
+    import shlex
     import stat
     import tempfile
 
@@ -238,15 +252,45 @@ def test_write_scrcpy_launch_script_is_executable_and_writes_pid():
         assert script_path.endswith(".command")
         assert os.path.isfile(script_path)
         assert os.stat(script_path).st_mode & stat.S_IXUSR
+        assert log_path.endswith("scrcpy.log")
         body = open(script_path, encoding="utf-8").read()
         assert body.startswith("#!/bin/bash")
         assert pid_path in body
         assert log_path in body
+        # stdout+stderr must land in the temp-dir log for post-mortem inspection
+        assert "2>&1" in body
+        assert ">>" in body
+        assert shlex.quote(log_path) in body or log_path in body
         assert "/opt/homebrew/bin/scrcpy" in body
         assert "--record=/tmp/device-mirror-test/record.mkv" in body
         assert "exec" in body
     finally:
         shutil.rmtree(record_dir, ignore_errors=True)
+
+
+def test_teardown_cleans_record_dir_only_after_pipeline_stop():
+    """Temp dir must survive until teardown (kill) — not mid-wait cleanup."""
+    import tempfile
+
+    record_dir = tempfile.mkdtemp(prefix="device-mirror-teardown-test-")
+    record_path = os.path.join(record_dir, "record.mkv")
+    log_path = os.path.join(record_dir, "scrcpy.log")
+    with open(record_path, "wb") as fh:
+        fh.write(b"\x00" * 32)
+    with open(log_path, "w", encoding="utf-8") as fh:
+        fh.write("scrcpy starting\n")
+
+    session = DeviceMirrorSession()
+    session._record_path = record_path
+    session._record_dir = record_dir
+    assert os.path.isdir(record_dir)
+    assert os.path.isfile(log_path)
+
+    session._teardown_procs()
+
+    assert not os.path.isdir(record_dir)
+    assert session._record_path is None
+    assert session._record_dir is None
 
 
 def test_build_open_terminal_cmd_uses_terminal_app():
@@ -380,3 +424,91 @@ def test_fmp4_broadcast_prerolls_media_until_first_subscriber():
     assert next(gen) == moof1
     assert next(gen) == moof2
     gen.close()
+
+
+def test_live_pipeline_is_ready_without_media_fragments():
+    """scrcpy Metal init can exceed any fragment timeout — never gate connected on moof."""
+    assert is_pipeline_ready_for_stream(scrcpy_alive=True, ffmpeg_alive=True) is True
+    assert is_pipeline_ready_for_stream(scrcpy_alive=True, ffmpeg_alive=False) is False
+    assert is_pipeline_ready_for_stream(scrcpy_alive=False, ffmpeg_alive=True) is False
+
+
+def test_start_pipeline_source_does_not_abort_on_missing_media_fragments():
+    """Regression: fragment wait + _abort_start kills initializing scrcpy (zsh: killed)."""
+    import inspect
+
+    from app.device_mirror import DeviceMirrorSession
+
+    src = inspect.getsource(DeviceMirrorSession._start_pipeline)
+    assert "_wait_for_media_fragment" not in src
+
+
+def test_concurrent_connect_async_never_overlaps_workers():
+    """Rapid concurrent POSTs must serialize — never two pipelines at once."""
+    session = DeviceMirrorSession()
+    active = 0
+    max_active = 0
+    lock = threading.Lock()
+
+    def counting_worker(self, epoch: int = 0):
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.05)
+        with lock:
+            active -= 1
+        with self._lock:
+            if epoch != self._connect_epoch:
+                return
+        self._set_state("connected", device_address="192.168.1.1:5555", message=None)
+
+    with patch.object(DeviceMirrorSession, "_connect_worker", counting_worker):
+        callers = [threading.Thread(target=session.connect_async) for _ in range(24)]
+        for t in callers:
+            t.start()
+        for t in callers:
+            t.join(timeout=2.0)
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            thread = session._connect_thread
+            if thread is None or not thread.is_alive():
+                break
+            thread.join(timeout=0.05)
+
+    assert max_active == 1
+    assert session.get_status()["state"] == "connected"
+
+
+def test_connect_while_running_tears_down_then_restarts():
+    """Idempotent connect: kill any in-flight/running pipeline before a new start."""
+    session = DeviceMirrorSession()
+    teardown_calls: list[float] = []
+    start_count = 0
+    count_lock = threading.Lock()
+
+    def fake_teardown(self):
+        teardown_calls.append(time.monotonic())
+
+    def recording_start(self, epoch: int = 0):
+        nonlocal start_count
+        with count_lock:
+            start_count += 1
+        self._set_state("connected", device_address="10.0.0.2:5555", message=None)
+
+    with (
+        patch.object(DeviceMirrorSession, "_teardown_procs", fake_teardown),
+        patch.object(DeviceMirrorSession, "_connect_worker", recording_start),
+    ):
+        session.connect_async()
+        if session._connect_thread:
+            session._connect_thread.join(timeout=2.0)
+        assert session.get_status()["state"] == "connected"
+
+        session.connect_async()
+        if session._connect_thread:
+            session._connect_thread.join(timeout=2.0)
+
+    assert start_count == 2
+    assert len(teardown_calls) >= 1
+    assert session.get_status()["state"] == "connected"

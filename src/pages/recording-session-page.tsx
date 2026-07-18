@@ -163,7 +163,10 @@ export function RecordingSessionPage() {
                   </button>
                   <button
                     type="button"
-                    disabled={recording.isSaving}
+                    disabled={
+                      recording.isSaving ||
+                      ['searching', 'found', 'connecting'].includes(recording.deviceState)
+                    }
                     onClick={() => void recording.startDeviceMirror()}
                     className="inline-flex items-center justify-center rounded-full bg-white px-5 py-2.5 text-sm font-semibold text-neutral-900 transition hover:bg-white/90 disabled:opacity-50"
                   >

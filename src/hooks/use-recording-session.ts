@@ -5,6 +5,7 @@ import {
   getDeviceStatus,
   type DeviceMirrorState,
 } from '@/lib/api'
+import { createDeviceConnectGuard } from '@/lib/device-connect-guard'
 import { useAssetLibrary } from '@/context/asset-library-context'
 import { useRecordings } from '@/context/recordings-context'
 import { useSettings } from '@/context/settings-context'
@@ -139,6 +140,7 @@ export function useRecordingSession(options?: {
   const [deviceError, setDeviceError] = useState<string | null>(null)
   const screenSourceRef = useRef<'none' | 'display' | 'device'>('none')
   const devicePollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const deviceConnectGuardRef = useRef(createDeviceConnectGuard())
 
   const setCameraLayout = useCallback((patch: Partial<CameraLayoutSettings>) => {
     setCameraLayoutState((current) => {
@@ -630,6 +632,7 @@ export function useRecordingSession(options?: {
 
   const stopDeviceMirror = useCallback(async () => {
     clearDevicePoll()
+    deviceConnectGuardRef.current.release()
     try {
       await disconnectDevice()
     } catch {
@@ -687,6 +690,9 @@ export function useRecordingSession(options?: {
   }, [])
 
   const startDeviceMirror = useCallback(async () => {
+    // Sync guard — React state updates are too slow to prevent double-clicks.
+    if (!deviceConnectGuardRef.current.tryAcquire()) return
+
     if (screenSourceRef.current === 'display') {
       stopMediaStream(screenStreamRef.current)
       screenStreamRef.current = null
@@ -704,6 +710,7 @@ export function useRecordingSession(options?: {
     try {
       await connectDevice()
     } catch {
+      deviceConnectGuardRef.current.release()
       setDeviceState('error')
       setDeviceError("Couldn't connect to your phone. Check that it's unlocked and on the same Wi‑Fi, then retry.")
       return
@@ -720,17 +727,20 @@ export function useRecordingSession(options?: {
 
           if (status.state === 'connected') {
             clearDevicePoll()
+            deviceConnectGuardRef.current.release()
             if (attachStarted) return
             attachStarted = true
             await attachDeviceStream()
           } else if (status.state === 'error' || status.state === 'idle') {
             clearDevicePoll()
+            deviceConnectGuardRef.current.release()
             if (status.state === 'error') {
               setScreenShareEnabled(false)
             }
           }
         } catch {
           clearDevicePoll()
+          deviceConnectGuardRef.current.release()
           setDeviceState('error')
           setDeviceError('Connection lost. Retry to reconnect.')
         }
