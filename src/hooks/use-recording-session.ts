@@ -1,7 +1,14 @@
+import {
+  connectDevice,
+  deviceStreamUrl,
+  disconnectDevice,
+  getDeviceStatus,
+  type DeviceMirrorState,
+} from '@/lib/api'
 import { useAssetLibrary } from '@/context/asset-library-context'
 import { useRecordings } from '@/context/recordings-context'
 import { useSettings } from '@/context/settings-context'
-import { acquireMediaStream, stopMediaStream } from '@/lib/media-devices'
+import { acquireMediaStream, getMediaErrorMessage, stopMediaStream } from '@/lib/media-devices'
 import { formatRecordedDate } from '@/lib/format'
 import { resolveBackgroundVideoUrl, syncBackgroundGif, syncBackgroundImageElement, isAnimatedGifBackground } from '@/lib/background-assets'
 import {
@@ -15,6 +22,7 @@ import {
   applySegmentationMask,
   composeBlurOnlyBackground,
   getCameraSegmenter,
+  isSegmentationMaskFresh,
   resetSegmentationSmoothing,
   segmentCameraFrame,
   type SegmentationMaskSnapshot,
@@ -33,10 +41,9 @@ import type { FloatingSticker } from '@/lib/floating-stickers'
 import {
   getRecorderMimeType,
   getRecorderOptions,
-  YOUTUBE_OUTPUT_HEIGHT,
-  YOUTUBE_OUTPUT_WIDTH,
 } from '@/lib/recording-output'
 import { generateThumbnail } from '@/lib/recording-storage'
+import { studioStore, useStudioStore } from '@/stores/studio-store'
 import { AnimatedGifPlayer } from '@/lib/animated-gif-player'
 import {
   defaultCameraLayout,
@@ -45,7 +52,7 @@ import {
   type CameraLayoutSettings,
   type ScreenShareLayoutSettings,
 } from '@/types/recording-layout'
-import { useCallback, useEffect, useRef, useState, type MutableRefObject } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type MutableRefObject } from 'react'
 import { useNavigate } from 'react-router-dom'
 
 function createInitialCameraLayout(): CameraLayoutSettings {
@@ -57,8 +64,21 @@ export function useRecordingSession(options?: {
 }) {
   const navigate = useNavigate()
   const { settings } = useSettings()
+  const { session } = useStudioStore()
   const { addDraftRecording } = useRecordings()
   const { assets } = useAssetLibrary()
+
+  const outputWidth = session?.contentType.canvasWidth ?? 1920
+  const outputHeight = session?.contentType.canvasHeight ?? 1080
+  const outputDimensions = useMemo(
+    () => ({ width: outputWidth, height: outputHeight }),
+    [outputWidth, outputHeight],
+  )
+  const maxDurationSeconds = session?.youtubeMetadata.maxDurationSeconds ?? null
+  const outputDimensionsRef = useRef(outputDimensions)
+  outputDimensionsRef.current = outputDimensions
+  const sessionRef = useRef(session)
+  sessionRef.current = session
 
   const cameraVideoRef = useRef<HTMLVideoElement>(null)
   const screenVideoRef = useRef<HTMLVideoElement>(null)
@@ -84,6 +104,7 @@ export function useRecordingSession(options?: {
   const segmentedPersonCanvasRef = useRef<HTMLCanvasElement | null>(null)
   const blurredBackgroundCanvasRef = useRef<HTMLCanvasElement | null>(null)
   const segmentationMaskRef = useRef<SegmentationMaskSnapshot | null>(null)
+  const segmentationMaskAtRef = useRef<number | null>(null)
   const visualStateRef = useRef({
     cameraEnabled: true,
     screenShareEnabled: false,
@@ -93,6 +114,7 @@ export function useRecordingSession(options?: {
     mirrorCamera: true,
   })
   const isRecordingRef = useRef(false)
+  const stopRecordingRef = useRef<(() => Promise<void>) | null>(null)
 
   const [cameraEnabled, setCameraEnabled] = useState(true)
   const [screenShareEnabled, setScreenShareEnabled] = useState(false)
@@ -109,8 +131,14 @@ export function useRecordingSession(options?: {
   const [isRecording, setIsRecording] = useState(false)
   const [elapsedSeconds, setElapsedSeconds] = useState(0)
   const [isSaving, setIsSaving] = useState(false)
+  const handingOffToEditorRef = useRef(false)
   const [isConnecting, setIsConnecting] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [deviceState, setDeviceState] = useState<DeviceMirrorState>('idle')
+  const [deviceMessage, setDeviceMessage] = useState<string | null>(null)
+  const [deviceError, setDeviceError] = useState<string | null>(null)
+  const screenSourceRef = useRef<'none' | 'display' | 'device'>('none')
+  const devicePollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   const setCameraLayout = useCallback((patch: Partial<CameraLayoutSettings>) => {
     setCameraLayoutState((current) => {
@@ -154,7 +182,16 @@ export function useRecordingSession(options?: {
       setMicCaptureEnabled(micAudioEnabledRef.current)
       setCameraEnabled(true)
     } catch (connectError) {
-      setError(connectError instanceof Error ? connectError.message : 'Unable to connect camera.')
+      const message = getMediaErrorMessage(connectError)
+      const isBusySource =
+        (connectError instanceof DOMException && connectError.name === 'NotReadableError') ||
+        /could not start video source/i.test(
+          connectError instanceof Error ? connectError.message : message,
+        )
+      // Device briefly busy / already open — don't block the studio with a banner.
+      if (!isBusySource) {
+        setError(message)
+      }
       setCameraEnabled(false)
     } finally {
       setIsConnecting(false)
@@ -295,12 +332,14 @@ export function useRecordingSession(options?: {
           const mask = await segmentCameraFrame(video, performance.now())
           if (mask && active) {
             segmentationMaskRef.current = mask
+            segmentationMaskAtRef.current = performance.now()
           }
         } catch {
           // Model may still be loading on first use.
         }
       } else {
         segmentationMaskRef.current = null
+        segmentationMaskAtRef.current = null
         resetSegmentationSmoothing()
       }
 
@@ -314,6 +353,7 @@ export function useRecordingSession(options?: {
     return () => {
       active = false
       segmentationMaskRef.current = null
+      segmentationMaskAtRef.current = null
       resetSegmentationSmoothing()
     }
   }, [cameraEnabled, cameraLayout.backgroundType])
@@ -345,9 +385,10 @@ export function useRecordingSession(options?: {
     const context = canvas.getContext('2d')
     if (!context) return
 
-    if (canvas.width !== YOUTUBE_OUTPUT_WIDTH || canvas.height !== YOUTUBE_OUTPUT_HEIGHT) {
-      canvas.width = YOUTUBE_OUTPUT_WIDTH
-      canvas.height = YOUTUBE_OUTPUT_HEIGHT
+    const { width: outW, height: outH } = outputDimensionsRef.current
+    if (canvas.width !== outW || canvas.height !== outH) {
+      canvas.width = outW
+      canvas.height = outH
     }
 
     const {
@@ -367,23 +408,29 @@ export function useRecordingSession(options?: {
     let segmentedPersonCanvas: HTMLCanvasElement | null = null
     let blurredBackgroundCanvas: HTMLCanvasElement | null = null
 
-    if (
-      cameraSource &&
-      camLayout.backgroundType !== 'none' &&
-      segmentationMaskRef.current &&
-      segmentedPersonCanvasRef.current
-    ) {
-      const segmentedContext = segmentedPersonCanvasRef.current.getContext('2d')
-      if (segmentedContext) {
-        applySegmentationMask(segmentedContext, cameraSource, segmentationMaskRef.current)
-        segmentedPersonCanvas = segmentedPersonCanvasRef.current
+    if (cameraSource && camLayout.backgroundType !== 'none' && segmentedPersonCanvasRef.current) {
+      const mask = segmentationMaskRef.current
+      const maskFresh = isSegmentationMaskFresh(segmentationMaskAtRef.current, performance.now())
 
-        if (camLayout.backgroundType === 'blur' && blurredBackgroundCanvasRef.current) {
-          composeBlurOnlyBackground(
-            blurredBackgroundCanvasRef.current,
-            cameraSource,
-            segmentationMaskRef.current,
-          )
+      if (mask && maskFresh) {
+        const segmentedContext = segmentedPersonCanvasRef.current.getContext('2d')
+        if (segmentedContext) {
+          applySegmentationMask(segmentedContext, cameraSource, mask)
+          segmentedPersonCanvas = segmentedPersonCanvasRef.current
+
+          if (camLayout.backgroundType === 'blur' && blurredBackgroundCanvasRef.current) {
+            composeBlurOnlyBackground(
+              blurredBackgroundCanvasRef.current,
+              cameraSource,
+              mask,
+            )
+            blurredBackgroundCanvas = blurredBackgroundCanvasRef.current
+          }
+        }
+      } else if (segmentedPersonCanvasRef.current.width > 0) {
+        // Keep the last good cutout briefly so Shorts don't flash opaque camera / empty stage.
+        segmentedPersonCanvas = segmentedPersonCanvasRef.current
+        if (camLayout.backgroundType === 'blur' && blurredBackgroundCanvasRef.current?.width) {
           blurredBackgroundCanvas = blurredBackgroundCanvasRef.current
         }
       }
@@ -430,14 +477,18 @@ export function useRecordingSession(options?: {
     })
   }, [options?.stickersRef])
 
+  const paintCompositorFrameRef = useRef(paintCompositorFrame)
+  paintCompositorFrameRef.current = paintCompositorFrame
+
   useEffect(() => {
     const canvas = canvasRef.current
     if (!canvas) return
 
     const resize = () => {
-      if (canvas.width !== YOUTUBE_OUTPUT_WIDTH || canvas.height !== YOUTUBE_OUTPUT_HEIGHT) {
-        canvas.width = YOUTUBE_OUTPUT_WIDTH
-        canvas.height = YOUTUBE_OUTPUT_HEIGHT
+      const { width, height } = outputDimensionsRef.current
+      if (canvas.width !== width || canvas.height !== height) {
+        canvas.width = width
+        canvas.height = height
       }
     }
 
@@ -456,7 +507,7 @@ export function useRecordingSession(options?: {
     const render = () => {
       // While recording, the capture clock owns painting so track frames stay live.
       if (!captureClockRef.current) {
-        paintCompositorFrame(null)
+        paintCompositorFrameRef.current(null)
       }
       compositorFrameRef.current = requestAnimationFrame(render)
     }
@@ -468,7 +519,7 @@ export function useRecordingSession(options?: {
       resizeObserver.disconnect()
       cancelAnimationFrame(compositorFrameRef.current)
     }
-  }, [paintCompositorFrame])
+  }, [outputWidth, outputHeight])
 
   const stopCaptureClock = useCallback(() => {
     captureClockRef.current?.stop()
@@ -487,22 +538,26 @@ export function useRecordingSession(options?: {
     captureClockRef.current = startRecordingCaptureClock({
       screenTrack,
       cameraTrack,
-      paint: (sources) => paintCompositorFrame(sources),
+      paint: (sources) => paintCompositorFrameRef.current(sources),
       captureTrack: canvasCaptureTrackRef.current,
     })
-  }, [paintCompositorFrame])
+  }, [])
 
   useEffect(() => {
     if (!isRecording) return
 
     const interval = window.setInterval(() => {
-      if (recordingStartedAtRef.current) {
-        setElapsedSeconds(Math.floor((Date.now() - recordingStartedAtRef.current) / 1000))
+      if (!recordingStartedAtRef.current) return
+      const elapsed = Math.floor((Date.now() - recordingStartedAtRef.current) / 1000)
+      setElapsedSeconds(elapsed)
+
+      if (maxDurationSeconds != null && elapsed >= maxDurationSeconds) {
+        void stopRecordingRef.current?.()
       }
     }, 250)
 
     return () => window.clearInterval(interval)
-  }, [isRecording])
+  }, [isRecording, maxDurationSeconds])
 
   const setCameraEnabledState = useCallback((enabled: boolean) => {
     const stream = cameraStreamRef.current
@@ -549,8 +604,132 @@ export function useRecordingSession(options?: {
     })
   }, [])
 
+  const clearDevicePoll = useCallback(() => {
+    if (devicePollRef.current != null) {
+      clearInterval(devicePollRef.current)
+      devicePollRef.current = null
+    }
+  }, [])
+
+  useEffect(() => {
+    return () => {
+      clearDevicePoll()
+      if (screenSourceRef.current === 'device') {
+        void disconnectDevice().catch(() => undefined)
+      }
+    }
+  }, [clearDevicePoll])
+
+  const clearScreenVideoElement = useCallback(() => {
+    const video = screenVideoRef.current
+    if (!video) return
+    video.srcObject = null
+    video.removeAttribute('src')
+    video.load()
+  }, [])
+
+  const stopDeviceMirror = useCallback(async () => {
+    clearDevicePoll()
+    try {
+      await disconnectDevice()
+    } catch {
+      // Best-effort teardown — local UI still resets.
+    }
+    if (screenSourceRef.current === 'device') {
+      stopMediaStream(screenStreamRef.current)
+      screenStreamRef.current = null
+      clearScreenVideoElement()
+      screenSourceRef.current = 'none'
+      setScreenShareEnabled(false)
+      setScreenAudioAvailable(false)
+    }
+    setDeviceState('idle')
+    setDeviceMessage(null)
+    setDeviceError(null)
+  }, [clearDevicePoll, clearScreenVideoElement])
+
+  const attachDeviceStream = useCallback(async () => {
+    const video = screenVideoRef.current
+    if (!video) return
+
+    video.srcObject = null
+    video.crossOrigin = 'anonymous'
+    video.src = deviceStreamUrl()
+    await video.play().catch(() => undefined)
+
+    const media = video as HTMLVideoElement & { captureStream(): MediaStream }
+    const captured = media.captureStream()
+    screenStreamRef.current = captured
+    screenSourceRef.current = 'device'
+    const hasAudio = captured.getAudioTracks().length > 0
+    setScreenAudioAvailable(hasAudio)
+    captured.getAudioTracks().forEach((track: MediaStreamTrack) => {
+      track.enabled = screenAudioEnabledRef.current
+    })
+    setScreenAudioCaptureEnabled(screenAudioEnabledRef.current)
+    setScreenShareEnabled(true)
+  }, [])
+
+  const startDeviceMirror = useCallback(async () => {
+    if (screenSourceRef.current === 'display') {
+      stopMediaStream(screenStreamRef.current)
+      screenStreamRef.current = null
+      clearScreenVideoElement()
+      screenSourceRef.current = 'none'
+      setScreenShareEnabled(false)
+      setScreenAudioAvailable(false)
+    }
+
+    clearDevicePoll()
+    setDeviceError(null)
+    setDeviceMessage(null)
+    setDeviceState('searching')
+
+    try {
+      await connectDevice()
+    } catch {
+      setDeviceState('error')
+      setDeviceError("Couldn't connect to your phone. Check that it's unlocked and on the same Wi‑Fi, then retry.")
+      return
+    }
+
+    devicePollRef.current = setInterval(() => {
+      void (async () => {
+        try {
+          const status = await getDeviceStatus()
+          setDeviceState(status.state)
+          setDeviceMessage(status.message)
+          setDeviceError(status.error)
+
+          if (status.state === 'connected') {
+            clearDevicePoll()
+            await attachDeviceStream()
+          } else if (status.state === 'error' || status.state === 'idle') {
+            clearDevicePoll()
+            if (status.state === 'error') {
+              setScreenShareEnabled(false)
+            }
+          }
+        } catch {
+          clearDevicePoll()
+          setDeviceState('error')
+          setDeviceError('Connection lost. Retry to reconnect.')
+        }
+      })()
+    }, 500)
+  }, [attachDeviceStream, clearDevicePoll, clearScreenVideoElement])
+
+  const retryDeviceMirror = useCallback(async () => {
+    await stopDeviceMirror()
+    await startDeviceMirror()
+  }, [startDeviceMirror, stopDeviceMirror])
+
   const startScreenShare = useCallback(async () => {
-    if (screenStreamRef.current) return
+    if (screenStreamRef.current && screenSourceRef.current === 'display') return
+
+    if (screenSourceRef.current === 'device' || deviceState !== 'idle') {
+      await stopDeviceMirror()
+    }
 
     try {
       const stream = await navigator.mediaDevices.getDisplayMedia({
@@ -559,6 +738,7 @@ export function useRecordingSession(options?: {
       })
 
       screenStreamRef.current = stream
+      screenSourceRef.current = 'display'
       const hasScreenAudio = stream.getAudioTracks().length > 0
       setScreenAudioAvailable(hasScreenAudio)
       stream.getAudioTracks().forEach((track) => {
@@ -567,6 +747,7 @@ export function useRecordingSession(options?: {
       setScreenAudioCaptureEnabled(screenAudioEnabledRef.current)
 
       if (screenVideoRef.current) {
+        screenVideoRef.current.removeAttribute('src')
         screenVideoRef.current.srcObject = stream
         await screenVideoRef.current.play().catch(() => undefined)
       }
@@ -574,6 +755,7 @@ export function useRecordingSession(options?: {
       stream.getVideoTracks()[0]?.addEventListener('ended', () => {
         stopMediaStream(screenStreamRef.current)
         screenStreamRef.current = null
+        screenSourceRef.current = 'none'
         if (screenVideoRef.current) screenVideoRef.current.srcObject = null
         setScreenShareEnabled(false)
         setScreenAudioAvailable(false)
@@ -581,17 +763,22 @@ export function useRecordingSession(options?: {
 
       setScreenShareEnabled(true)
     } catch {
-      setError('Screen sharing was cancelled or blocked.')
+      // User cancelled the picker or the browser blocked share — stay quiet.
     }
-  }, [])
+  }, [deviceState, stopDeviceMirror])
 
   const stopScreenShare = useCallback(() => {
+    if (screenSourceRef.current === 'device') {
+      void stopDeviceMirror()
+      return
+    }
     stopMediaStream(screenStreamRef.current)
     screenStreamRef.current = null
-    if (screenVideoRef.current) screenVideoRef.current.srcObject = null
+    screenSourceRef.current = 'none'
+    clearScreenVideoElement()
     setScreenShareEnabled(false)
     setScreenAudioAvailable(false)
-  }, [])
+  }, [clearScreenVideoElement, stopDeviceMirror])
 
   const toggleScreenShare = useCallback(async () => {
     if (screenShareEnabled) {
@@ -671,7 +858,10 @@ export function useRecordingSession(options?: {
       }
 
       chunksRef.current = []
-      const recorder = new MediaRecorder(combinedStream, getRecorderOptions(mimeType))
+      const recorder = new MediaRecorder(
+        combinedStream,
+        getRecorderOptions(mimeType, outputDimensionsRef.current),
+      )
 
       recorder.ondataavailable = (event) => {
         if (event.data.size > 0) chunksRef.current.push(event.data)
@@ -709,17 +899,28 @@ export function useRecordingSession(options?: {
     isRecordingRef.current = false
     setIsRecording(false)
     setElapsedSeconds(0)
+    studioStore.clearSession()
+
+    clearDevicePoll()
+    if (screenSourceRef.current === 'device') {
+      void disconnectDevice().catch(() => undefined)
+    }
 
     stopMediaStream(cameraStreamRef.current)
     stopMediaStream(screenStreamRef.current)
     cameraStreamRef.current = null
     screenStreamRef.current = null
+    screenSourceRef.current = 'none'
 
     if (cameraVideoRef.current) cameraVideoRef.current.srcObject = null
-    if (screenVideoRef.current) screenVideoRef.current.srcObject = null
+    clearScreenVideoElement()
+
+    setDeviceState('idle')
+    setDeviceMessage(null)
+    setDeviceError(null)
 
     cancelAnimationFrame(compositorFrameRef.current)
-  }, [stopCaptureClock])
+  }, [clearDevicePoll, clearScreenVideoElement, stopCaptureClock])
 
   const stopRecording = useCallback(async () => {
     const recorder = mediaRecorderRef.current
@@ -743,30 +944,55 @@ export function useRecordingSession(options?: {
       : 1
 
     try {
-      const thumbnailBlob = await generateThumbnail(videoBlob)
+      const dims = outputDimensionsRef.current
+      const activeSession = sessionRef.current
+      const thumbScale = 320 / Math.max(dims.width, dims.height)
+      const thumbnailBlob = await generateThumbnail(videoBlob, {
+        width: Math.round(dims.width * thumbScale),
+        height: Math.round(dims.height * thumbScale),
+      })
+      const draftName = `Recording — ${formatRecordedDate(new Date().toISOString())}`
+      const youtubeMetadata = activeSession
+        ? { ...activeSession.youtubeMetadata, title: draftName }
+        : undefined
+
       const recording = await addDraftRecording({
-        name: `Recording — ${formatRecordedDate(new Date().toISOString())}`,
+        name: draftName,
         videoBlob,
         thumbnailBlob,
         mimeType,
         durationSeconds,
+        contentTypeId: activeSession?.contentType.id,
+        aspectRatio: activeSession?.contentType.aspectRatio,
+        youtubeMetadata,
       })
 
       isRecordingRef.current = false
       setIsRecording(false)
       mediaRecorderRef.current = null
       recordingStartedAtRef.current = null
-      navigate(`/editor-studio?recording=${recording.id}`)
+
+      // Ref must flip before clearSession — store updates are sync and would
+      // otherwise bounce RecordingSessionPage to the lobby mid-handoff.
+      handingOffToEditorRef.current = true
+      navigate(`/editor-studio?recording=${recording.id}`, { replace: true })
+      studioStore.clearSession()
     } catch (saveError) {
       setError(saveError instanceof Error ? saveError.message : 'Failed to save recording.')
       isRecordingRef.current = false
       setIsRecording(false)
+      handingOffToEditorRef.current = false
     } finally {
       setIsSaving(false)
     }
   }, [addDraftRecording, navigate, stopCaptureClock])
 
+  stopRecordingRef.current = stopRecording
+
   return {
+    session,
+    aspectRatio: session?.contentType.aspectRatio ?? '16:9',
+    maxDurationSeconds,
     cameraVideoRef,
     screenVideoRef,
     cameraBgVideoRef,
@@ -779,12 +1005,16 @@ export function useRecordingSession(options?: {
     micAudioEnabled,
     screenAudioEnabled,
     screenAudioAvailable,
+    deviceState,
+    deviceMessage,
+    deviceError,
     cameraLayout,
     screenShareLayout,
     effectId,
     isRecording,
     elapsedSeconds,
     isSaving,
+    handingOffToEditorRef,
     isConnecting,
     error,
     assets,
@@ -796,6 +1026,9 @@ export function useRecordingSession(options?: {
     toggleMicAudio,
     toggleScreenAudio,
     toggleScreenShare,
+    startDeviceMirror,
+    stopDeviceMirror,
+    retryDeviceMirror,
     setEffectId,
     startRecording,
     stopRecording,

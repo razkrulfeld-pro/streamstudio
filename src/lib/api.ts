@@ -54,6 +54,9 @@ export function initiateUpload(metadata: UploadMetadata): Promise<{ upload_uri: 
       description: metadata.description ?? '',
       privacy_status: metadata.privacy_status,
       category_id: metadata.category_id ?? '22',
+      tags: metadata.tags ?? [],
+      made_for_kids: metadata.made_for_kids ?? false,
+      contains_synthetic_media: metadata.contains_synthetic_media ?? false,
       mime_type: metadata.mime_type ?? 'video/webm',
     }),
   })
@@ -63,4 +66,35 @@ export function exchangeAuthCode(code: string): Promise<{ success: boolean; mess
   return request<{ success: boolean; message: string }>(
     `/auth/callback?code=${encodeURIComponent(code)}`,
   )
+}
+
+export type DeviceMirrorState =
+  | 'idle'
+  | 'searching'
+  | 'found'
+  | 'connecting'
+  | 'connected'
+  | 'error'
+
+export interface DeviceStatus {
+  state: DeviceMirrorState
+  deviceAddress: string | null
+  message: string | null
+  error: string | null
+}
+
+export function connectDevice(): Promise<{ ok: boolean }> {
+  return request<{ ok: boolean }>('/api/device/connect', { method: 'POST' })
+}
+
+export function getDeviceStatus(): Promise<DeviceStatus> {
+  return request<DeviceStatus>('/api/device/status')
+}
+
+export function disconnectDevice(): Promise<{ ok: boolean }> {
+  return request<{ ok: boolean }>('/api/device/disconnect', { method: 'POST' })
+}
+
+export function deviceStreamUrl(): string {
+  return `${apiBaseUrl()}/api/device/stream`
 }
