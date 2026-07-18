@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 from typing import Iterator, Literal, TypedDict
@@ -145,10 +147,17 @@ def resolve_scrcpy_headless_flags(scrcpy: str) -> list[str]:
 def build_scrcpy_cmd(
     scrcpy: str,
     serial: str,
+    record_path: str,
     *,
     bit_rate_flag: str = "--video-bit-rate=8M",
     headless_flags: list[str] | None = None,
 ) -> list[str]:
+    """Build scrcpy argv.
+
+    Important: do not use ``--record=-``. On scrcpy 4.x that creates a file
+    literally named ``-`` in the process cwd (which Vite then watches and
+    full-reloads the SPA, bouncing the studio back to the lobby).
+    """
     headless = headless_flags if headless_flags is not None else resolve_scrcpy_headless_flags(scrcpy)
     return [
         scrcpy,
@@ -158,19 +167,19 @@ def build_scrcpy_cmd(
         "--max-size=1080",
         bit_rate_flag,
         "--audio-codec=aac",
-        "--record=-",
+        f"--record={record_path}",
         "--record-format=mkv",
     ]
 
 
-def build_ffmpeg_cmd(ffmpeg: str) -> list[str]:
+def build_ffmpeg_cmd(ffmpeg: str, input_path: str) -> list[str]:
     return [
         ffmpeg,
         "-hide_banner",
         "-loglevel",
         "error",
         "-i",
-        "pipe:0",
+        input_path,
         "-c",
         "copy",
         "-movflags",
@@ -191,6 +200,7 @@ class DeviceMirrorSession:
         self._tools: dict[str, str] | None = None
         self._scrcpy_proc: subprocess.Popen[bytes] | None = None
         self._ffmpeg_proc: subprocess.Popen[bytes] | None = None
+        self._tmp_dir: str | None = None
         self._stopping = False
         self._connect_thread: threading.Thread | None = None
         self._watcher_thread: threading.Thread | None = None
@@ -289,52 +299,63 @@ class DeviceMirrorSession:
             self.set_error("connect_failed")
             return
 
-        scrcpy_cmd = build_scrcpy_cmd(tools["scrcpy"], address)
-        ffmpeg_cmd = build_ffmpeg_cmd(tools["ffmpeg"])
-        logger.info("Starting scrcpy: %s", " ".join(scrcpy_cmd))
-
+        tmp_dir = tempfile.mkdtemp(prefix="streamstudio-mirror-")
+        fifo_path = os.path.join(tmp_dir, "mirror.mkv")
         try:
-            scrcpy_proc = subprocess.Popen(
-                scrcpy_cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-        except OSError:
-            # Retry once with legacy bit-rate flag
-            scrcpy_cmd = build_scrcpy_cmd(tools["scrcpy"], address, bit_rate_flag="--bit-rate=8M")
-            try:
-                scrcpy_proc = subprocess.Popen(
-                    scrcpy_cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                )
-            except OSError as exc:
-                logger.warning("Failed to start scrcpy: %s", exc)
-                self.set_error("connect_failed")
-                return
-
-        if scrcpy_proc.stdout is None:
-            scrcpy_proc.kill()
+            os.mkfifo(fifo_path)
+        except OSError as exc:
+            logger.warning("Failed to create mirror FIFO: %s", exc)
+            shutil.rmtree(tmp_dir, ignore_errors=True)
             self.set_error("connect_failed")
             return
 
+        self._tmp_dir = tmp_dir
+        scrcpy_cmd = build_scrcpy_cmd(tools["scrcpy"], address, fifo_path)
+        ffmpeg_cmd = build_ffmpeg_cmd(tools["ffmpeg"], fifo_path)
+        logger.info("Starting scrcpy: %s", " ".join(scrcpy_cmd))
+
+        # Open the FIFO reader first so scrcpy's writer does not block forever.
         try:
             ffmpeg_proc = subprocess.Popen(
                 ffmpeg_cmd,
-                stdin=scrcpy_proc.stdout,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
         except OSError as exc:
             logger.warning("Failed to start ffmpeg: %s", exc)
-            scrcpy_proc.kill()
+            self._cleanup_tmp()
             self.set_error("connect_failed")
             return
 
-        scrcpy_proc.stdout.close()
+        try:
+            scrcpy_proc = subprocess.Popen(
+                scrcpy_cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                cwd=tmp_dir,
+            )
+        except OSError:
+            scrcpy_cmd = build_scrcpy_cmd(
+                tools["scrcpy"],
+                address,
+                fifo_path,
+                bit_rate_flag="--bit-rate=8M",
+            )
+            try:
+                scrcpy_proc = subprocess.Popen(
+                    scrcpy_cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    cwd=tmp_dir,
+                )
+            except OSError as exc:
+                logger.warning("Failed to start scrcpy: %s", exc)
+                self._kill_procs(None, ffmpeg_proc)
+                self._cleanup_tmp()
+                self.set_error("connect_failed")
+                return
 
-        # Brief settle — if scrcpy dies immediately, treat as connect failure
-        time.sleep(0.4)
+        time.sleep(0.5)
         if scrcpy_proc.poll() is not None:
             stderr = b""
             try:
@@ -343,31 +364,16 @@ class DeviceMirrorSession:
                 pass
             logger.warning("scrcpy exited early: %s", stderr.decode("utf-8", errors="replace")[:500])
             self._kill_procs(scrcpy_proc, ffmpeg_proc)
-            # Retry with alternate bit-rate flag if we used the primary
-            if "--video-bit-rate=8M" in scrcpy_cmd:
-                alt = build_scrcpy_cmd(tools["scrcpy"], address, bit_rate_flag="--bit-rate=8M")
-                try:
-                    scrcpy_proc = subprocess.Popen(alt, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                    if scrcpy_proc.stdout is None:
-                        raise OSError("no stdout")
-                    ffmpeg_proc = subprocess.Popen(
-                        ffmpeg_cmd,
-                        stdin=scrcpy_proc.stdout,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                    )
-                    scrcpy_proc.stdout.close()
-                    time.sleep(0.4)
-                    if scrcpy_proc.poll() is not None:
-                        self._kill_procs(scrcpy_proc, ffmpeg_proc)
-                        self.set_error("connect_failed")
-                        return
-                except OSError:
-                    self.set_error("connect_failed")
-                    return
-            else:
-                self.set_error("connect_failed")
-                return
+            self._cleanup_tmp()
+            self.set_error("connect_failed")
+            return
+
+        if ffmpeg_proc.poll() is not None:
+            logger.warning("ffmpeg exited early while starting mirror")
+            self._kill_procs(scrcpy_proc, ffmpeg_proc)
+            self._cleanup_tmp()
+            self.set_error("connect_failed")
+            return
 
         with self._lock:
             self._scrcpy_proc = scrcpy_proc
@@ -420,6 +426,13 @@ class DeviceMirrorSession:
             self._scrcpy_proc = None
             self._ffmpeg_proc = None
         self._kill_procs(scrcpy, ffmpeg)
+        self._cleanup_tmp()
+
+    def _cleanup_tmp(self) -> None:
+        tmp = self._tmp_dir
+        self._tmp_dir = None
+        if tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
 
     @staticmethod
     def _kill_procs(

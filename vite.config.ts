@@ -65,6 +65,10 @@ export default defineConfig({
     },
   },
   server: {
+    watch: {
+      // Device mirror writes under backend/tmp; never full-reload the SPA for that.
+      ignored: ['**/backend/**', '**/backend/.venv/**'],
+    },
     proxy: {
       // Local extract API (uvicorn on :8080). Start with: cd backend && uvicorn app.main:app --port 8080
       '/api': {
