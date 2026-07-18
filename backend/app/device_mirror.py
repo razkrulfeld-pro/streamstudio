@@ -1,7 +1,15 @@
 from __future__ import annotations
 
+import logging
+import shutil
+import socket
+import subprocess
 import threading
-from typing import Literal, TypedDict
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Iterator, Literal, TypedDict
+
+logger = logging.getLogger(__name__)
 
 DeviceState = Literal["idle", "searching", "found", "connecting", "connected", "error"]
 
@@ -27,12 +35,172 @@ STATUS_MESSAGES = {
     "connecting": "Starting mirror…",
 }
 
+ADB_PORT = 5555
+SCAN_WORKERS = 64
+
 
 class DeviceStatus(TypedDict):
     state: DeviceState
     deviceAddress: str | None
     message: str | None
     error: str | None
+
+
+def resolve_tools() -> dict[str, str] | None:
+    paths: dict[str, str] = {}
+    for name in ("adb", "scrcpy", "ffmpeg"):
+        found = shutil.which(name)
+        if not found:
+            return None
+        paths[name] = found
+    return paths
+
+
+def _local_ipv4() -> str | None:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            ip = sock.getsockname()[0]
+    except OSError:
+        return None
+    if ip.startswith("127."):
+        return None
+    return ip
+
+
+def _probe_tcp(ip: str, port: int, timeout: float) -> bool:
+    try:
+        with socket.create_connection((ip, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def scan_for_adb_device(timeout_s: float = 5.0) -> str | None:
+    local_ip = _local_ipv4()
+    if not local_ip:
+        return None
+
+    parts = local_ip.split(".")
+    if len(parts) != 4:
+        return None
+    prefix = ".".join(parts[:3])
+    hosts = [f"{prefix}.{i}" for i in range(1, 255) if f"{prefix}.{i}" != local_ip]
+
+    deadline = time.monotonic() + timeout_s
+    per_host_timeout = min(0.35, max(0.1, timeout_s / 8))
+    found: str | None = None
+    found_lock = threading.Lock()
+
+    def check(ip: str) -> str | None:
+        if time.monotonic() > deadline:
+            return None
+        if _probe_tcp(ip, ADB_PORT, per_host_timeout):
+            return f"{ip}:{ADB_PORT}"
+        return None
+
+    with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as pool:
+        futures = [pool.submit(check, ip) for ip in hosts]
+        for future in as_completed(futures):
+            if time.monotonic() > deadline:
+                break
+            try:
+                result = future.result()
+            except Exception:
+                continue
+            if result:
+                with found_lock:
+                    if found is None:
+                        found = result
+                break
+
+    return found
+
+
+def adb_connect(adb: str, address: str, timeout_s: float = 10.0) -> bool:
+    try:
+        result = subprocess.run(
+            [adb, "connect", address],
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.warning("adb connect failed: %s", exc)
+        return False
+
+    output = f"{result.stdout}\n{result.stderr}".lower()
+    if "connected" not in output and "already connected" not in output:
+        logger.warning("adb connect unexpected output: %s", output.strip())
+        # Still check devices list — some builds are terse.
+
+    try:
+        devices = subprocess.run(
+            [adb, "devices"],
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+    for line in devices.stdout.splitlines():
+        line = line.strip()
+        if not line or line.startswith("List"):
+            continue
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] == address and parts[1] == "device":
+            return True
+    return False
+
+
+def adb_disconnect(adb: str, address: str | None) -> None:
+    if not address:
+        return
+    try:
+        subprocess.run(
+            [adb, "disconnect", address],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.warning("adb disconnect failed: %s", exc)
+
+
+def build_scrcpy_cmd(scrcpy: str, serial: str, *, bit_rate_flag: str = "--video-bit-rate=8M") -> list[str]:
+    return [
+        scrcpy,
+        "--serial",
+        serial,
+        "--no-playback",
+        "--max-size=1080",
+        bit_rate_flag,
+        "--audio-codec=aac",
+        "--record=-",
+        "--record-format=mkv",
+    ]
+
+
+def build_ffmpeg_cmd(ffmpeg: str) -> list[str]:
+    return [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        "pipe:0",
+        "-c",
+        "copy",
+        "-movflags",
+        "frag_keyframe+empty_moov+default_base_moof",
+        "-f",
+        "mp4",
+        "pipe:1",
+    ]
 
 
 class DeviceMirrorSession:
@@ -42,6 +210,12 @@ class DeviceMirrorSession:
         self._device_address: str | None = None
         self._message: str | None = None
         self._error: str | None = None
+        self._tools: dict[str, str] | None = None
+        self._scrcpy_proc: subprocess.Popen[bytes] | None = None
+        self._ffmpeg_proc: subprocess.Popen[bytes] | None = None
+        self._stopping = False
+        self._connect_thread: threading.Thread | None = None
+        self._watcher_thread: threading.Thread | None = None
 
     def get_status(self) -> DeviceStatus:
         with self._lock:
@@ -80,3 +254,217 @@ class DeviceMirrorSession:
             self._device_address = None
             self._message = None
             self._error = None
+            self._tools = None
+
+    def connect_async(self) -> None:
+        with self._lock:
+            if self._state in ("searching", "found", "connecting", "connected"):
+                return
+            if self._connect_thread and self._connect_thread.is_alive():
+                return
+            self._stopping = False
+            thread = threading.Thread(target=self._connect_worker, name="device-mirror-connect", daemon=True)
+            self._connect_thread = thread
+        thread.start()
+
+    def _connect_worker(self) -> None:
+        try:
+            self._set_state("searching", message=STATUS_MESSAGES["searching"])
+            tools = resolve_tools()
+            if tools is None:
+                self.set_error("tools_missing")
+                return
+
+            address = scan_for_adb_device(timeout_s=5.0)
+            if self._stopping:
+                return
+            if address is None:
+                self.set_error("not_found")
+                return
+
+            self._set_state(
+                "found",
+                device_address=address,
+                message=STATUS_MESSAGES["found"],
+            )
+            self._set_state(
+                "connecting",
+                device_address=address,
+                message=STATUS_MESSAGES["connecting"],
+            )
+
+            if not adb_connect(tools["adb"], address):
+                self.set_error("connect_failed")
+                return
+
+            with self._lock:
+                self._tools = tools
+                self._device_address = address
+
+            self._start_pipeline()
+        except Exception:
+            logger.exception("Device connect failed unexpectedly")
+            if not self._stopping:
+                self.set_error("connect_failed")
+
+    def _start_pipeline(self) -> None:
+        tools = self._tools
+        address = self._device_address
+        if not tools or not address:
+            self.set_error("connect_failed")
+            return
+
+        scrcpy_cmd = build_scrcpy_cmd(tools["scrcpy"], address)
+        ffmpeg_cmd = build_ffmpeg_cmd(tools["ffmpeg"])
+
+        try:
+            scrcpy_proc = subprocess.Popen(
+                scrcpy_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except OSError:
+            # Retry once with legacy bit-rate flag
+            scrcpy_cmd = build_scrcpy_cmd(tools["scrcpy"], address, bit_rate_flag="--bit-rate=8M")
+            try:
+                scrcpy_proc = subprocess.Popen(
+                    scrcpy_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+            except OSError as exc:
+                logger.warning("Failed to start scrcpy: %s", exc)
+                self.set_error("connect_failed")
+                return
+
+        if scrcpy_proc.stdout is None:
+            scrcpy_proc.kill()
+            self.set_error("connect_failed")
+            return
+
+        try:
+            ffmpeg_proc = subprocess.Popen(
+                ffmpeg_cmd,
+                stdin=scrcpy_proc.stdout,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except OSError as exc:
+            logger.warning("Failed to start ffmpeg: %s", exc)
+            scrcpy_proc.kill()
+            self.set_error("connect_failed")
+            return
+
+        scrcpy_proc.stdout.close()
+
+        # Brief settle — if scrcpy dies immediately, treat as connect failure
+        time.sleep(0.4)
+        if scrcpy_proc.poll() is not None:
+            stderr = b""
+            try:
+                stderr = scrcpy_proc.stderr.read() if scrcpy_proc.stderr else b""
+            except Exception:
+                pass
+            logger.warning("scrcpy exited early: %s", stderr.decode("utf-8", errors="replace")[:500])
+            self._kill_procs(scrcpy_proc, ffmpeg_proc)
+            # Retry with alternate bit-rate flag if we used the primary
+            if "--video-bit-rate=8M" in scrcpy_cmd:
+                alt = build_scrcpy_cmd(tools["scrcpy"], address, bit_rate_flag="--bit-rate=8M")
+                try:
+                    scrcpy_proc = subprocess.Popen(alt, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    if scrcpy_proc.stdout is None:
+                        raise OSError("no stdout")
+                    ffmpeg_proc = subprocess.Popen(
+                        ffmpeg_cmd,
+                        stdin=scrcpy_proc.stdout,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                    )
+                    scrcpy_proc.stdout.close()
+                    time.sleep(0.4)
+                    if scrcpy_proc.poll() is not None:
+                        self._kill_procs(scrcpy_proc, ffmpeg_proc)
+                        self.set_error("connect_failed")
+                        return
+                except OSError:
+                    self.set_error("connect_failed")
+                    return
+            else:
+                self.set_error("connect_failed")
+                return
+
+        with self._lock:
+            self._scrcpy_proc = scrcpy_proc
+            self._ffmpeg_proc = ffmpeg_proc
+
+        self._set_state("connected", device_address=address, message=None)
+        watcher = threading.Thread(target=self._watch_procs, name="device-mirror-watch", daemon=True)
+        self._watcher_thread = watcher
+        watcher.start()
+
+    def _watch_procs(self) -> None:
+        while not self._stopping:
+            scrcpy = self._scrcpy_proc
+            ffmpeg = self._ffmpeg_proc
+            if scrcpy is None or ffmpeg is None:
+                return
+            if scrcpy.poll() is not None or ffmpeg.poll() is not None:
+                if not self._stopping:
+                    logger.warning("Mirror pipeline process exited")
+                    self._teardown_procs()
+                    self.set_error("connection_lost")
+                return
+            time.sleep(0.5)
+
+    def iter_stream(self) -> Iterator[bytes]:
+        while True:
+            with self._lock:
+                if self._state != "connected" or self._stopping:
+                    break
+                proc = self._ffmpeg_proc
+                stdout = proc.stdout if proc else None
+            if stdout is None:
+                break
+            chunk = stdout.read(65536)
+            if not chunk:
+                break
+            yield chunk
+
+    def disconnect(self) -> None:
+        self._stopping = True
+        tools = None
+        address = None
+        with self._lock:
+            tools = self._tools
+            address = self._device_address
+        self._teardown_procs()
+        if tools:
+            adb_disconnect(tools["adb"], address)
+        self.reset_to_idle()
+        self._stopping = False
+
+    def _teardown_procs(self) -> None:
+        with self._lock:
+            scrcpy = self._scrcpy_proc
+            ffmpeg = self._ffmpeg_proc
+            self._scrcpy_proc = None
+            self._ffmpeg_proc = None
+        self._kill_procs(scrcpy, ffmpeg)
+
+    @staticmethod
+    def _kill_procs(
+        scrcpy: subprocess.Popen[bytes] | None,
+        ffmpeg: subprocess.Popen[bytes] | None,
+    ) -> None:
+        for proc in (ffmpeg, scrcpy):
+            if proc is None:
+                continue
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+            except OSError:
+                pass
