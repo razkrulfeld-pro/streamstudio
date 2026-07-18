@@ -108,12 +108,53 @@ def pick_adb_device(serials: list[str]) -> str | None:
     return usable[0]
 
 
-def build_scrcpy_cmd(scrcpy: str, serial: str, *, bit_rate_flag: str = "--video-bit-rate=8M") -> list[str]:
+def resolve_scrcpy_headless_flags(scrcpy: str) -> list[str]:
+    """Pick flags that keep scrcpy fully headless for the installed build.
+
+    scrcpy 4.x: ``--no-window`` actually suppresses the SDL window;
+    ``--no-playback`` alone still opens a titled window. Older builds used
+    ``--no-display``.
+    """
+    help_text = ""
+    try:
+        result = subprocess.run(
+            [scrcpy, "--help"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        help_text = f"{result.stdout}\n{result.stderr}"
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.warning("Could not probe scrcpy --help: %s", exc)
+
+    flags: list[str] = []
+    if "--no-window" in help_text:
+        flags.append("--no-window")
+    if "--no-playback" in help_text:
+        flags.append("--no-playback")
+    elif "--no-display" in help_text:
+        flags.append("--no-display")
+
+    if not flags:
+        # Safe default for modern Homebrew scrcpy (4.x).
+        flags = ["--no-window", "--no-playback"]
+    return flags
+
+
+def build_scrcpy_cmd(
+    scrcpy: str,
+    serial: str,
+    *,
+    bit_rate_flag: str = "--video-bit-rate=8M",
+    headless_flags: list[str] | None = None,
+) -> list[str]:
+    headless = headless_flags if headless_flags is not None else resolve_scrcpy_headless_flags(scrcpy)
     return [
         scrcpy,
         "--serial",
         serial,
-        "--no-playback",
+        *headless,
         "--max-size=1080",
         bit_rate_flag,
         "--audio-codec=aac",
@@ -250,6 +291,7 @@ class DeviceMirrorSession:
 
         scrcpy_cmd = build_scrcpy_cmd(tools["scrcpy"], address)
         ffmpeg_cmd = build_ffmpeg_cmd(tools["ffmpeg"])
+        logger.info("Starting scrcpy: %s", " ".join(scrcpy_cmd))
 
         try:
             scrcpy_proc = subprocess.Popen(

@@ -7,6 +7,7 @@ from app.device_mirror import (
     build_scrcpy_cmd,
     list_ready_adb_devices,
     pick_adb_device,
+    resolve_scrcpy_headless_flags,
     resolve_tools,
 )
 
@@ -121,11 +122,40 @@ def test_pick_adb_device_falls_back_to_first():
     assert pick_adb_device([]) is None
 
 
+def test_resolve_scrcpy_headless_flags_prefers_no_window_and_no_playback():
+    help_text = (
+        "  -N, --no-playback\n"
+        "  --no-window\n"
+        "        Disable scrcpy window. Implies --no-video-playback.\n"
+    )
+    with patch("app.device_mirror.subprocess.run") as run:
+        run.return_value.stdout = help_text
+        run.return_value.stderr = ""
+        run.return_value.returncode = 0
+        assert resolve_scrcpy_headless_flags("/opt/homebrew/bin/scrcpy") == [
+            "--no-window",
+            "--no-playback",
+        ]
+
+
+def test_resolve_scrcpy_headless_flags_falls_back_to_no_display():
+    with patch("app.device_mirror.subprocess.run") as run:
+        run.return_value.stdout = "  --no-display\n"
+        run.return_value.stderr = ""
+        run.return_value.returncode = 0
+        assert resolve_scrcpy_headless_flags("/opt/homebrew/bin/scrcpy") == ["--no-display"]
+
+
 def test_scrcpy_cmd_passes_explicit_serial_host_port():
-    cmd = build_scrcpy_cmd("/opt/homebrew/bin/scrcpy", "10.100.102.6:37487")
+    cmd = build_scrcpy_cmd(
+        "/opt/homebrew/bin/scrcpy",
+        "10.100.102.6:37487",
+        headless_flags=["--no-window", "--no-playback"],
+    )
     assert cmd[0].endswith("scrcpy")
     serial_idx = cmd.index("--serial")
     assert cmd[serial_idx + 1] == "10.100.102.6:37487"
+    assert "--no-window" in cmd
     assert "--no-playback" in cmd
     assert "--max-size=1080" in cmd
     assert any("8M" in a for a in cmd)
