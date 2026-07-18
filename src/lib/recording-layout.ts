@@ -23,7 +23,7 @@ export function computeScreenShareFrameRect(
   stageWidth: number,
   stageHeight: number,
   margins: number,
-  _contentAspect = DEFAULT_SCREEN_SHARE_ASPECT,
+  contentAspect = DEFAULT_SCREEN_SHARE_ASPECT,
 ): BubbleRect {
   const inset = Math.max(0, margins)
   const maxInsetX = Math.max(0, (stageWidth - 96) / 2)
@@ -31,13 +31,27 @@ export function computeScreenShareFrameRect(
   const marginX = Math.min(inset, maxInsetX)
   const marginY = Math.min(inset, maxInsetY)
 
-  // Screenshare container = stage minus optional margins. Content is drawn
-  // with contain (full capture, centered) inside this rect.
+  const availW = Math.max(1, stageWidth - marginX * 2)
+  const availH = Math.max(1, stageHeight - marginY * 2)
+  const aspect =
+    Number.isFinite(contentAspect) && contentAspect > 0
+      ? contentAspect
+      : DEFAULT_SCREEN_SHARE_ASPECT
+
+  // Size the screen/device frame to the stage (session) aspect within margins.
+  // Source video letterboxes inside the frame — rotation must not change frame aspect.
+  let width = availW
+  let height = availW / aspect
+  if (height > availH) {
+    height = availH
+    width = availH * aspect
+  }
+
   return {
-    x: marginX,
-    y: marginY,
-    width: Math.max(1, stageWidth - marginX * 2),
-    height: Math.max(1, stageHeight - marginY * 2),
+    x: marginX + (availW - width) / 2,
+    y: marginY + (availH - height) / 2,
+    width: Math.max(1, width),
+    height: Math.max(1, height),
   }
 }
 

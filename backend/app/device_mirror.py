@@ -1,26 +1,36 @@
+"""Device mirror via scrcpy-server raw H.264 → WebSocket (no GUI / ffmpeg / Terminal)."""
+
 from __future__ import annotations
 
 import logging
 import os
 import queue
 import re
-import shlex
 import shutil
 import signal
+import socket
 import subprocess
-import tempfile
 import threading
 import time
 from typing import Callable, Iterator, Literal, TypedDict
+
+from app.scrcpy_h264 import (
+    annex_b_split_nals,
+    build_scrcpy_server_shell_cmd,
+    build_ws_nal_message,
+    is_key_nal,
+    resolve_scrcpy_server_jar,
+    resolve_scrcpy_server_version,
+)
 
 logger = logging.getLogger(__name__)
 
 DeviceState = Literal["idle", "searching", "found", "connecting", "connected", "error"]
 
-# mDNS / Bonjour service discovery entries are not usable scrcpy serials.
 ADB_MDNS_MARKER = "._adb-tls-connect._tcp"
-# Prefer a plain IPv4 host:port serial from Wireless debugging.
 CLEAN_HOST_PORT_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}:\d+$")
+REMOTE_JAR = "/data/local/tmp/scrcpy-server.jar"
+TARGET_CAPTURE_LAG_S = 2.0
 
 FRIENDLY_ERRORS = {
     "not_found": (
@@ -29,7 +39,7 @@ FRIENDLY_ERRORS = {
     ),
     "tools_missing": (
         "Device tools aren't available on this Mac. "
-        "Install adb, scrcpy, and ffmpeg (Homebrew), then retry."
+        "Install adb and scrcpy (Homebrew), then retry."
     ),
     "connect_failed": (
         "Couldn't connect to your phone. "
@@ -44,22 +54,6 @@ STATUS_MESSAGES = {
     "connecting": "Starting mirror…",
 }
 
-# Terminal.app launch + Metal init can take well over the old ~20s budget.
-SCRCPY_PID_TIMEOUT_S = 30.0
-RECORD_APPEAR_TIMEOUT_S = 90.0
-RECORD_APPEAR_MIN_BYTES = 1024
-
-
-def is_pipeline_ready_for_stream(*, scrcpy_alive: bool, ffmpeg_alive: bool) -> bool:
-    """Clients may attach once the recorder + remuxer are alive.
-
-    Do **not** require ffmpeg media fragments (``moof``) first. On this Mac,
-    scrcpy Metal/server init often takes longer than any practical fragment
-    wait; aborting on missing media kills a healthy initializing scrcpy
-    (Terminal shows ``zsh: killed``) before video ever flows.
-    """
-    return scrcpy_alive and ffmpeg_alive
-
 
 class DeviceStatus(TypedDict):
     state: DeviceState
@@ -69,13 +63,11 @@ class DeviceStatus(TypedDict):
 
 
 def resolve_tools() -> dict[str, str] | None:
-    paths: dict[str, str] = {}
-    for name in ("adb", "scrcpy", "ffmpeg"):
-        found = shutil.which(name)
-        if not found:
-            return None
-        paths[name] = found
-    return paths
+    adb = shutil.which("adb")
+    jar = resolve_scrcpy_server_jar()
+    if not adb or not jar:
+        return None
+    return {"adb": adb, "server_jar": jar}
 
 
 def is_mdns_adb_serial(serial: str) -> bool:
@@ -87,7 +79,6 @@ def is_clean_host_port_serial(serial: str) -> bool:
 
 
 def list_ready_adb_devices(adb: str, timeout_s: float = 10.0) -> list[str]:
-    """Return usable serials currently listed as `device` by `adb devices`."""
     try:
         result = subprocess.run(
             [adb, "devices"],
@@ -116,7 +107,6 @@ def list_ready_adb_devices(adb: str, timeout_s: float = 10.0) -> list[str]:
 
 
 def pick_adb_device(serials: list[str]) -> str | None:
-    """Prefer a clean host:port serial; otherwise the first usable device."""
     usable = [s for s in serials if not is_mdns_adb_serial(s)]
     if not usable:
         return None
@@ -129,354 +119,212 @@ def pick_adb_device(serials: list[str]) -> str | None:
     return usable[0]
 
 
-def resolve_scrcpy_headless_flags(scrcpy: str) -> list[str]:
-    """Pick flags that hide the mirror UI without disabling Metal capture.
-
-    On macOS, scrcpy 4.x needs a real window so the Metal renderer can
-    initialize. ``--no-window`` fails silently (no video). Prefer an
-    off-screen borderless window plus ``--no-playback`` instead.
-    """
-    help_text = _scrcpy_help_text(scrcpy)
-
-    can_park_offscreen = (
-        "--window-x" in help_text
-        and "--window-y" in help_text
-        and "--window-borderless" in help_text
-    )
-    if can_park_offscreen:
-        flags: list[str] = []
-        if "--no-playback" in help_text:
-            flags.append("--no-playback")
-        flags.extend(
-            [
-                "--window-borderless",
-                "--window-x=-10000",
-                "--window-y=-10000",
-            ]
-        )
-        return flags
-
-    flags = []
-    if "--no-window" in help_text:
-        flags.append("--no-window")
-    if "--no-playback" in help_text:
-        flags.append("--no-playback")
-    elif "--no-display" in help_text:
-        flags.append("--no-display")
-
-    if not flags:
-        flags = [
-            "--no-playback",
-            "--window-borderless",
-            "--window-x=-10000",
-            "--window-y=-10000",
-        ]
-    return flags
+def wake_device_screen(adb: str, serial: str) -> None:
+    for args in (
+        [adb, "-s", serial, "shell", "input", "keyevent", "KEYCODE_WAKEUP"],
+        [adb, "-s", serial, "shell", "settings", "put", "system", "screen_off_timeout", "600000"],
+    ):
+        try:
+            subprocess.run(args, capture_output=True, text=True, timeout=5, check=False)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            logger.warning("wake_device_screen failed (%s): %s", args, exc)
 
 
-def resolve_scrcpy_video_source_flags(scrcpy: str) -> list[str]:
-    """Explicitly enable display capture when the installed scrcpy supports it."""
-    help_text = _scrcpy_help_text(scrcpy)
-    if "--video-source" in help_text:
-        return ["--video-source=display"]
-    return []
+def pick_free_tcp_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
 
 
-def _scrcpy_help_text(scrcpy: str) -> str:
-    try:
-        result = subprocess.run(
-            [scrcpy, "--help"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-        return f"{result.stdout}\n{result.stderr}"
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        logger.warning("Could not probe scrcpy --help: %s", exc)
-        return ""
+class H264Subscription:
+    """One WebSocket client's handle on an H264Broadcast (registered immediately)."""
+
+    def __init__(
+        self,
+        broadcast: "H264Broadcast",
+        q: queue.Queue[bytes | None],
+        bootstrap: list[bytes],
+    ) -> None:
+        self._broadcast = broadcast
+        self._q = q
+        self._bootstrap = bootstrap
+        self._closed = False
+
+    def __iter__(self) -> Iterator[bytes]:
+        # Do NOT close() in a finally here — generator GC / early exit would drop
+        # the subscriber from _subscribers while the WebSocket is still open.
+        # Callers (WS producer / handler) must call close() explicitly.
+        for msg in self._bootstrap:
+            if self._closed:
+                return
+            yield msg
+        while not self._closed:
+            item = self._q.get()
+            if item is None or self._closed:
+                return
+            yield item
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._broadcast._drop_subscriber(self._q)
+        try:
+            self._q.put_nowait(None)
+        except queue.Full:
+            pass
 
 
-def create_record_file() -> tuple[str, str]:
-    """Create a temp dir + regular record path for scrcpy ``--record=``.
+class H264Broadcast:
+    """Fan-out framed H.264 NAL messages to WebSocket subscribers."""
 
-    A real file (not a FIFO) lets scrcpy open its window / Metal context and
-    append Matroska independently. ffmpeg then follows via ``tail -F``.
-    """
-    temp_dir = tempfile.mkdtemp(prefix="device-mirror-")
-    record_path = os.path.join(temp_dir, "record.mkv")
-    return record_path, temp_dir
-
-
-def build_scrcpy_cmd(
-    scrcpy: str,
-    serial: str,
-    *,
-    bit_rate_flag: str = "--video-bit-rate=8M",
-    headless_flags: list[str] | None = None,
-    video_source_flags: list[str] | None = None,
-    record_path: str,
-) -> list[str]:
-    """Build scrcpy argv that records Matroska into ``record_path`` (regular file).
-
-    Never use ``--record=-``: scrcpy 4.x treats that as a file named ``-``.
-    Never use a FIFO here: under uvicorn a named pipe can stall Metal init;
-    record to a file and let ``tail -F`` feed ffmpeg instead.
-    """
-    headless = headless_flags if headless_flags is not None else resolve_scrcpy_headless_flags(scrcpy)
-    video_source = (
-        video_source_flags
-        if video_source_flags is not None
-        else resolve_scrcpy_video_source_flags(scrcpy)
-    )
-    return [
-        scrcpy,
-        "--serial",
-        serial,
-        *headless,
-        *video_source,
-        "--max-size=1080",
-        bit_rate_flag,
-        "--audio-codec=aac",
-        f"--record={record_path}",
-        "--record-format=mkv",
-    ]
-
-
-def write_scrcpy_launch_script(scrcpy_cmd: list[str], record_dir: str) -> tuple[str, str, str]:
-    """Write an executable ``.command`` that runs scrcpy in Terminal.app.
-
-    Returns ``(script_path, pid_path, log_path)``. The script writes its PID
-    (preserved across ``exec``) so uvicorn can track/kill the GUI-launched process.
-    scrcpy stdout/stderr are redirected to ``scrcpy.log`` in the temp dir for
-    post-mortem inspection (dir is kept until the pipeline fully stops).
-    """
-    script_path = os.path.join(record_dir, "run-scrcpy.command")
-    pid_path = os.path.join(record_dir, "scrcpy.pid")
-    log_path = os.path.join(record_dir, "scrcpy.log")
-    quoted = " ".join(shlex.quote(part) for part in scrcpy_cmd)
-    quoted_log = shlex.quote(log_path)
-    body = (
-        "#!/bin/bash\n"
-        f"echo $$ > {shlex.quote(pid_path)}\n"
-        f"echo \"[device-mirror] launching scrcpy at $(date)\" >{quoted_log}\n"
-        f"exec {quoted} >>{quoted_log} 2>&1\n"
-    )
-    with open(script_path, "w", encoding="utf-8") as fh:
-        fh.write(body)
-    os.chmod(script_path, 0o755)
-    return script_path, pid_path, log_path
-
-
-def build_open_terminal_cmd(script_path: str) -> list[str]:
-    """Launch a shell script inside Terminal.app (real macOS GUI / Metal context)."""
-    return ["open", "-a", "Terminal.app", script_path]
-
-
-def build_tail_cmd(record_path: str) -> list[str]:
-    """Follow a growing scrcpy record file from byte 0 (macOS ``tail -F``)."""
-    return ["tail", "-c", "+0", "-F", record_path]
-
-
-def build_ffmpeg_cmd(ffmpeg: str) -> list[str]:
-    """Remux live Matroska from stdin (tailed file) into fragmented MP4 on stdout.
-
-    Input must be ``pipe:0`` fed by ``tail -F``: opening a growing ``.mkv``
-    directly with ``ffmpeg -i file`` hits premature EOF between scrcpy flushes.
-
-    ``frag_every_frame`` + ``max_interleave_delta=0`` are required so ffmpeg
-    flushes media fragments while the input is still open (plain
-    ``frag_keyframe`` alone buffers until EOF with scrcpy's long GOPs).
-    """
-    return [
-        ffmpeg,
-        "-hide_banner",
-        "-loglevel",
-        "warning",
-        "-fflags",
-        "+genpts",
-        "-f",
-        "matroska",
-        "-i",
-        "pipe:0",
-        "-c",
-        "copy",
-        "-f",
-        "mp4",
-        "-movflags",
-        "frag_every_frame+empty_moov+default_base_moof+skip_trailer",
-        "-max_interleave_delta",
-        "0",
-        "-muxdelay",
-        "0",
-        "-muxpreload",
-        "0",
-        "pipe:1",
-    ]
-
-
-def extract_fmp4_init_segment(buffer: bytes) -> tuple[bytes | None, bytes]:
-    """Split a fMP4 buffer into ``(ftyp+moov, remainder)`` when init is complete.
-
-    Returns ``(None, buffer)`` until both ``ftyp`` and ``moov`` boxes are fully
-    present. Used so late HTTP subscribers can replay the init segment.
-    """
-    offset = 0
-    has_ftyp = False
-    moov_end: int | None = None
-    length = len(buffer)
-
-    while offset + 8 <= length:
-        size = int.from_bytes(buffer[offset : offset + 4], "big")
-        typ = buffer[offset + 4 : offset + 8]
-        if size == 0:
-            break
-        if size == 1:
-            if offset + 16 > length:
-                return None, buffer
-            size = int.from_bytes(buffer[offset + 8 : offset + 16], "big")
-        if size < 8:
-            break
-        if offset + size > length:
-            return None, buffer
-        if typ == b"ftyp":
-            has_ftyp = True
-        elif typ == b"moov":
-            moov_end = offset + size
-            break
-        offset += size
-
-    if not has_ftyp or moov_end is None:
-        return None, buffer
-    return buffer[:moov_end], buffer[moov_end:]
-
-
-class Fmp4Broadcast:
-    """Fan-out live fMP4 so every subscriber receives the init segment first.
-
-    ffmpeg stdout is a single consumer pipe. Browsers (and Vite/devtools) often
-    open ``/api/device/stream`` more than once; without replaying ``ftyp+moov``,
-    the second connection gets mid-stream ``moof`` bytes and cannot decode.
-
-    Until the first subscriber attaches, post-init media is held in a bounded
-    preroll buffer so early ``/stream`` clients still receive the burst that
-    proved the remuxer is live.
-    """
-
-    _QUEUE_SIZE = 64
-    _MAX_PREROLL_BYTES = 2_000_000
+    _QUEUE_SIZE = 256
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._buffer = b""
-        self._init: bytes | None = None
-        self._media_seen = False
-        self._preroll: list[bytes] = []
-        self._preroll_bytes = 0
         self._subscribers: list[queue.Queue[bytes | None]] = []
         self._closed = False
+        self._sps: bytes | None = None
+        self._pps: bytes | None = None
+        self._last_idr: bytes | None = None
+        self._bytes_fed = 0
+        self._nal_count = 0
 
     @property
-    def init_segment(self) -> bytes | None:
+    def stats(self) -> dict[str, int | bool]:
         with self._lock:
-            return self._init
+            return {
+                "bytes_fed": self._bytes_fed,
+                "nal_count": self._nal_count,
+                "subscribers": len(self._subscribers),
+                "has_sps": self._sps is not None,
+                "has_pps": self._pps is not None,
+                "has_idr": self._last_idr is not None,
+                "closed": self._closed,
+            }
 
-    @property
-    def media_seen(self) -> bool:
-        with self._lock:
-            return self._media_seen
-
-    def feed(self, data: bytes) -> None:
-        if not data:
-            return
+    def feed(self, message: bytes, *, nal_type: int) -> None:
         with self._lock:
             if self._closed:
                 return
-            if self._init is None:
-                self._buffer += data
-                init, rest = extract_fmp4_init_segment(self._buffer)
-                if init is None:
-                    return
-                self._init = init
-                self._buffer = b""
-                data = rest
-                if not data:
-                    return
-            self._media_seen = True
-            if not self._subscribers:
-                self._preroll.append(data)
-                self._preroll_bytes += len(data)
-                while self._preroll_bytes > self._MAX_PREROLL_BYTES and self._preroll:
-                    dropped = self._preroll.pop(0)
-                    self._preroll_bytes -= len(dropped)
-                return
+            self._bytes_fed += len(message)
+            self._nal_count += 1
+            if nal_type == 7:
+                self._sps = message
+            elif nal_type == 8:
+                self._pps = message
+            elif nal_type == 5:
+                self._last_idr = message
             dead: list[queue.Queue[bytes | None]] = []
             for q in self._subscribers:
                 try:
-                    q.put_nowait(data)
+                    q.put_nowait(message)
                 except queue.Full:
-                    dead.append(q)
-            if dead:
-                self._subscribers = [q for q in self._subscribers if q not in dead]
+                    # Drop oldest by getting one, then put — stay on live edge.
+                    try:
+                        q.get_nowait()
+                    except queue.Empty:
+                        pass
+                    try:
+                        q.put_nowait(message)
+                    except queue.Full:
+                        dead.append(q)
+            for q in dead:
+                if q in self._subscribers:
+                    self._subscribers.remove(q)
 
     def close(self) -> None:
         with self._lock:
             self._closed = True
             subs = list(self._subscribers)
             self._subscribers.clear()
-            self._preroll.clear()
-            self._preroll_bytes = 0
         for q in subs:
             try:
                 q.put_nowait(None)
             except queue.Full:
                 pass
 
-    def subscribe(self) -> Iterator[bytes]:
+    @property
+    def closed(self) -> bool:
+        with self._lock:
+            return self._closed
+
+    def _add_subscriber(self, q: queue.Queue[bytes | None]) -> int:
+        """Append a subscriber queue; return the new subscriber count (-1 if closed)."""
+        with self._lock:
+            if self._closed:
+                logger.warning(
+                    "broadcast._add_subscriber: refused (broadcast closed) id=%s",
+                    id(self),
+                )
+                return -1
+            self._subscribers.append(q)
+            count = len(self._subscribers)
+        logger.info(
+            "broadcast._add_subscriber: appended q id=%s broadcast id=%s subscribers=%s",
+            id(q),
+            id(self),
+            count,
+        )
+        return count
+
+    def open_subscription(self) -> H264Subscription | None:
+        """Register a subscriber immediately (before any yield / thread hop)."""
         q: queue.Queue[bytes | None] = queue.Queue(maxsize=self._QUEUE_SIZE)
         with self._lock:
             if self._closed:
-                return
-            init = self._init
-            preroll = list(self._preroll)
-            self._preroll.clear()
-            self._preroll_bytes = 0
+                logger.warning(
+                    "broadcast.open_subscription: None (closed) broadcast id=%s",
+                    id(self),
+                )
+                return None
+            bootstrap = [m for m in (self._sps, self._pps, self._last_idr) if m is not None]
             self._subscribers.append(q)
+            count = len(self._subscribers)
+        logger.info(
+            "broadcast._add_subscriber: appended q id=%s broadcast id=%s subscribers=%s "
+            "bootstrap=%s",
+            id(q),
+            id(self),
+            count,
+            len(bootstrap),
+        )
+        return H264Subscription(self, q, bootstrap)
 
-        try:
-            if init:
-                yield init
-            for chunk in preroll:
-                yield chunk
-            while True:
-                item = q.get()
-                if item is None:
-                    return
-                yield item
-        finally:
-            with self._lock:
-                if q in self._subscribers:
-                    self._subscribers.remove(q)
+    def _drop_subscriber(self, q: queue.Queue[bytes | None]) -> None:
+        with self._lock:
+            if q in self._subscribers:
+                self._subscribers.remove(q)
+                count = len(self._subscribers)
+            else:
+                count = len(self._subscribers)
+                logger.info(
+                    "broadcast._drop_subscriber: q id=%s not in list broadcast id=%s "
+                    "subscribers=%s",
+                    id(q),
+                    id(self),
+                    count,
+                )
+                return
+        logger.info(
+            "broadcast._drop_subscriber: removed q id=%s broadcast id=%s subscribers=%s",
+            id(q),
+            id(self),
+            count,
+        )
 
+    def subscribe(self) -> Iterator[bytes]:
+        sub = self.open_subscription()
+        if sub is None:
+            return iter(())
 
-def _spawn_stderr_logger(proc: subprocess.Popen[bytes], label: str) -> threading.Thread:
-    """Continuously drain subprocess stderr into the uvicorn log."""
+        def _gen() -> Iterator[bytes]:
+            try:
+                yield from sub
+            finally:
+                sub.close()
 
-    def _run() -> None:
-        stream = proc.stderr
-        if stream is None:
-            return
-        try:
-            for raw in iter(stream.readline, b""):
-                line = raw.decode("utf-8", errors="replace").rstrip()
-                if line:
-                    logger.info("%s: %s", label, line)
-        except Exception:
-            logger.exception("Failed reading %s stderr", label)
-
-    thread = threading.Thread(target=_run, name=f"{label}-stderr", daemon=True)
-    thread.start()
-    return thread
+        return _gen()
 
 
 class DeviceMirrorSession:
@@ -489,16 +337,30 @@ class DeviceMirrorSession:
         self._message: str | None = None
         self._error: str | None = None
         self._tools: dict[str, str] | None = None
-        self._scrcpy_pid: int | None = None
-        self._tail_proc: subprocess.Popen[bytes] | None = None
-        self._ffmpeg_proc: subprocess.Popen[bytes] | None = None
-        self._broadcast: Fmp4Broadcast | None = None
-        self._pump_thread: threading.Thread | None = None
-        self._record_path: str | None = None
-        self._record_dir: str | None = None
+        self._server_proc: subprocess.Popen[bytes] | None = None
+        self._tcp_sock: socket.socket | None = None
+        self._forward_port: int | None = None
+        self._broadcast: H264Broadcast | None = None
+        self._reader_thread: threading.Thread | None = None
+        self._pipeline_wall_t0: float | None = None
+        self._first_nal_wall: float | None = None
+        self._last_nal_wall: float | None = None
+        self._nal_count = 0
+        self._bytes_out = 0
+        self._bytes_read_tcp = 0
+        self._bridge_stage: str = "idle"
+        self._bridge_detail: str | None = None
         self._stopping = False
         self._connect_thread: threading.Thread | None = None
-        self._watcher_thread: threading.Thread | None = None
+
+    def _set_bridge_stage(self, stage: str, detail: str | None = None) -> None:
+        with self._lock:
+            self._bridge_stage = stage
+            self._bridge_detail = detail
+        if detail:
+            logger.info("bridge.stage: %s — %s", stage, detail)
+        else:
+            logger.info("bridge.stage: %s", stage)
 
     def get_status(self) -> DeviceStatus:
         with self._lock:
@@ -508,6 +370,43 @@ class DeviceMirrorSession:
                 "message": self._message,
                 "error": self._error,
             }
+
+    def get_latency(self) -> dict[str, float | int | str | bool | None]:
+        now = time.time()
+        with self._lock:
+            wall_t0 = self._pipeline_wall_t0
+            first_nal = self._first_nal_wall
+            last_nal = self._last_nal_wall
+            state = self._state
+            port = self._forward_port
+            broadcast = self._broadcast
+            nal_count = self._nal_count
+            bytes_out = self._bytes_out
+            bytes_read_tcp = self._bytes_read_tcp
+            bridge_stage = self._bridge_stage
+            bridge_detail = self._bridge_detail
+        age = (now - wall_t0) if wall_t0 else None
+        tip_age = (now - last_nal) if last_nal else None
+        return {
+            "state": state,
+            "pipelineAgeS": age,
+            "captureTipAgeS": tip_age,
+            "targetCaptureLagS": TARGET_CAPTURE_LAG_S,
+            "withinTarget": tip_age is not None and tip_age <= TARGET_CAPTURE_LAG_S,
+            "stages": {
+                "firstNalAfterS": (first_nal - wall_t0) if first_nal and wall_t0 else None,
+                "lastNalAgeS": tip_age,
+            },
+            "bridgeStage": bridge_stage,
+            "bridgeDetail": bridge_detail,
+            "forwardPort": port,
+            "nalCount": nal_count,
+            "bytesOut": bytes_out,
+            "bytesReadTcp": bytes_read_tcp,
+            "broadcast": broadcast.stats if broadcast else None,
+            "wallClock": now,
+            "transport": "websocket-h264",
+        }
 
     def _set_state(
         self,
@@ -540,12 +439,6 @@ class DeviceMirrorSession:
             self._tools = None
 
     def connect_async(self) -> None:
-        """Start (or restart) a mirror session.
-
-        Concurrent / repeated calls are serialized: any in-flight or running
-        pipeline is torn down before a new one starts, and only the latest
-        connect epoch proceeds. Never runs two pipelines at once.
-        """
         with self._lock:
             self._connect_epoch += 1
             epoch = self._connect_epoch
@@ -557,7 +450,6 @@ class DeviceMirrorSession:
                     if epoch != self._connect_epoch:
                         return
                     self._stopping = False
-                # Always clear any prior pipeline before starting a new one.
                 self._teardown_procs()
                 with self._lock:
                     if epoch != self._connect_epoch:
@@ -596,23 +488,19 @@ class DeviceMirrorSession:
             self.set_error("not_found")
             return
 
-        self._set_state(
-            "found",
-            device_address=address,
-            message=STATUS_MESSAGES["found"],
-        )
+        self._set_state("found", device_address=address, message=STATUS_MESSAGES["found"])
         self._set_state(
             "connecting",
             device_address=address,
             message=STATUS_MESSAGES["connecting"],
         )
-
         with self._lock:
             if epoch != self._connect_epoch:
                 return
             self._tools = tools
             self._device_address = address
 
+        wake_device_screen(tools["adb"], address)
         self._start_pipeline(epoch)
 
     def _is_stale(self, epoch: int) -> bool:
@@ -628,197 +516,237 @@ class DeviceMirrorSession:
             self.set_error("connect_failed")
             return
 
+        adb = tools["adb"]
+        jar = tools["server_jar"]
+        version = resolve_scrcpy_server_version()
+        port = pick_free_tcp_port()
+        pipeline_wall_t0 = time.time()
+        self._set_bridge_stage("push_jar", f"jar={jar} remote={REMOTE_JAR}")
+
+        # Push server jar
         try:
-            record_path, record_dir = create_record_file()
-        except OSError as exc:
-            logger.warning("Failed to create record path: %s", exc)
-            self.set_error("connect_failed")
-            return
-
-        # Bind temp paths immediately so disconnect/teardown can clean them
-        # even if connect aborts mid-wait. Do not rmtree while scrcpy may still
-        # be starting via Terminal.app.
-        with self._lock:
-            if epoch != self._connect_epoch:
-                return
-            self._record_path = record_path
-            self._record_dir = record_dir
-
-        scrcpy_cmd = build_scrcpy_cmd(tools["scrcpy"], address, record_path=record_path)
-        try:
-            script_path, pid_path, log_path = write_scrcpy_launch_script(scrcpy_cmd, record_dir)
-        except OSError as exc:
-            logger.warning("Failed to write scrcpy launch script: %s", exc)
-            self._abort_start(epoch)
-            return
-
-        open_cmd = build_open_terminal_cmd(script_path)
-        tail_cmd = build_tail_cmd(record_path)
-        ffmpeg_cmd = build_ffmpeg_cmd(tools["ffmpeg"])
-        logger.info(
-            "Starting mirror pipeline via Terminal.app + file-tail %s: %s | %s | %s",
-            record_path,
-            " ".join(open_cmd),
-            " ".join(tail_cmd),
-            " ".join(ffmpeg_cmd),
-        )
-
-        # Launch scrcpy inside Terminal.app so Metal gets a real macOS GUI session.
-        # uvicorn's process tree has no foreground app context; open(1) does.
-        if self._is_stale(epoch):
-            self._abort_start(epoch)
-            return
-        try:
-            opened = subprocess.run(open_cmd, capture_output=True, text=True, timeout=10, check=False)
+            push = subprocess.run(
+                [adb, "-s", address, "push", jar, REMOTE_JAR],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
         except (OSError, subprocess.TimeoutExpired) as exc:
-            logger.warning("Failed to open Terminal.app for scrcpy: %s", exc)
+            self._set_bridge_stage("push_jar_failed", str(exc))
+            logger.warning("adb push failed: %s", exc)
             self._abort_start(epoch)
             return
-        if opened.returncode != 0:
-            logger.warning(
-                "open -a Terminal.app failed (rc=%s): %s",
-                opened.returncode,
-                (opened.stderr or opened.stdout or "").strip(),
-            )
+        if push.returncode != 0:
+            detail = (push.stderr or push.stdout).strip()
+            self._set_bridge_stage("push_jar_failed", detail)
+            logger.warning("adb push failed: %s", detail)
             self._abort_start(epoch)
             return
+        self._set_bridge_stage("push_jar_ok", (push.stdout or "").strip()[:200])
 
-        scrcpy_pid = self._wait_for_scrcpy_pid(
-            pid_path,
-            timeout_s=SCRCPY_PID_TIMEOUT_S,
-            should_abort=lambda: self._is_stale(epoch),
-        )
-        if scrcpy_pid is None:
-            if self._is_stale(epoch):
-                self._abort_start(epoch)
-                return
-            logger.warning("Timed out waiting for scrcpy pid file %s; log=%s", pid_path, log_path)
-            self._spill_scrcpy_log(log_path)
-            self._abort_start(epoch)
-            return
-
-        if self._is_stale(epoch):
-            self._kill_scrcpy_pid(scrcpy_pid)
-            self._abort_start(epoch)
-            return
-
-        with self._lock:
-            if epoch != self._connect_epoch:
-                self._kill_scrcpy_pid(scrcpy_pid)
-                return
-            self._scrcpy_pid = scrcpy_pid
-
-        if not self._wait_for_record_bytes(
-            record_path,
-            scrcpy_pid,
-            timeout_s=RECORD_APPEAR_TIMEOUT_S,
-            min_bytes=RECORD_APPEAR_MIN_BYTES,
-            should_abort=lambda: self._is_stale(epoch),
-        ):
-            if self._is_stale(epoch):
-                self._abort_start(epoch)
-                return
-            logger.warning(
-                "Timed out waiting for scrcpy to write record file %s (waited %.0fs)",
-                record_path,
-                RECORD_APPEAR_TIMEOUT_S,
-            )
-            self._spill_scrcpy_log(log_path)
-            self._abort_start(epoch)
-            return
-
-        if self._is_stale(epoch):
-            self._abort_start(epoch)
-            return
-
-        logger.info("scrcpy pid=%s is writing %s; starting tail → ffmpeg", scrcpy_pid, record_path)
-
+        # Forward TCP → abstract socket (no Terminal, no GUI scrcpy)
+        self._set_bridge_stage("adb_forward", f"tcp:{port} → localabstract:scrcpy")
         try:
-            tail_proc = subprocess.Popen(
-                tail_cmd,
+            fwd = subprocess.run(
+                [adb, "-s", address, "forward", f"tcp:{port}", "localabstract:scrcpy"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            self._set_bridge_stage("adb_forward_failed", str(exc))
+            logger.warning("adb forward failed: %s", exc)
+            self._abort_start(epoch)
+            return
+        if fwd.returncode != 0:
+            detail = (fwd.stderr or fwd.stdout or f"rc={fwd.returncode}").strip()
+            self._set_bridge_stage("adb_forward_failed", detail)
+            logger.warning("adb forward failed: %s", detail)
+            self._abort_start(epoch)
+            return
+        self._set_bridge_stage(
+            "adb_forward_ok",
+            f"tcp:{port} → localabstract:scrcpy stdout={(fwd.stdout or '').strip()!r}",
+        )
+
+        server_cmd = build_scrcpy_server_shell_cmd(
+            adb=adb,
+            serial=address,
+            version=version,
+            max_size=1080,
+            bit_rate=8_000_000,
+            max_fps=60,
+            remote_jar=REMOTE_JAR,
+        )
+        self._set_bridge_stage("start_server", " ".join(server_cmd))
+        logger.info(
+            "Starting scrcpy-server raw H.264 on tcp:%s (no Terminal/GUI): %s",
+            port,
+            " ".join(server_cmd),
+        )
+        try:
+            server_proc = subprocess.Popen(
+                server_cmd,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.STDOUT,
+                bufsize=0,
             )
         except OSError as exc:
-            logger.warning("Failed to start tail: %s", exc)
+            self._set_bridge_stage("start_server_failed", str(exc))
+            logger.warning("Failed to start scrcpy-server: %s", exc)
+            self._remove_forward(adb, address, port)
+            self._abort_start(epoch)
+            return
+        self._set_bridge_stage("start_server_ok", f"pid={server_proc.pid}")
+
+        def _log_server() -> None:
+            stream = server_proc.stdout
+            if stream is None:
+                return
+            try:
+                for raw in iter(stream.readline, b""):
+                    line = raw.decode("utf-8", errors="replace").rstrip()
+                    if line:
+                        logger.info("scrcpy-server: %s", line)
+            except Exception:
+                logger.exception("Failed reading scrcpy-server output")
+
+        threading.Thread(target=_log_server, name="scrcpy-server-log", daemon=True).start()
+
+        # Server listens after start; connect with retries.
+        # IMPORTANT: `adb forward` accepts TCP even when nothing listens on the
+        # device — those sockets EOF immediately. Retry until we get a live
+        # connection (data or a blocking wait without EOF).
+        self._set_bridge_stage("tcp_connect", f"127.0.0.1:{port}")
+        sock: socket.socket | None = None
+        primed: bytes = b""
+        deadline = time.time() + 15.0
+        last_err: Exception | None = None
+        attempts = 0
+        eof_stubs = 0
+        while time.time() < deadline:
+            if self._is_stale(epoch):
+                server_proc.terminate()
+                self._remove_forward(adb, address, port)
+                return
+            if server_proc.poll() is not None:
+                self._set_bridge_stage(
+                    "tcp_connect_failed",
+                    f"scrcpy-server exited early rc={server_proc.returncode}",
+                )
+                logger.warning("scrcpy-server exited early rc=%s", server_proc.returncode)
+                self._remove_forward(adb, address, port)
+                self._abort_start(epoch)
+                return
+            attempts += 1
+            try:
+                candidate = socket.create_connection(("127.0.0.1", port), timeout=1.0)
+                candidate.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                candidate.settimeout(1.0)
+                try:
+                    first = candidate.recv(65536)
+                except socket.timeout:
+                    # Connected and alive; frames not yet — keep it.
+                    sock = candidate
+                    primed = b""
+                    self._set_bridge_stage(
+                        "tcp_connect_ok",
+                        f"port={port} attempts={attempts} eof_stubs={eof_stubs} "
+                        f"primed=0 (alive, waiting for first NAL)",
+                    )
+                    break
+                if not first:
+                    # Immediate EOF: forward stub without a listening server.
+                    eof_stubs += 1
+                    logger.info(
+                        "bridge.tcp: attempt=%s immediate EOF on tcp:%s (stub; retry)",
+                        attempts,
+                        port,
+                    )
+                    candidate.close()
+                    time.sleep(0.1)
+                    continue
+                sock = candidate
+                primed = first
+                self._set_bridge_stage(
+                    "tcp_connect_ok",
+                    f"port={port} attempts={attempts} eof_stubs={eof_stubs} "
+                    f"primed={len(primed)} first_hex={primed[:16].hex()}",
+                )
+                break
+            except OSError as exc:
+                last_err = exc
+                logger.info("bridge.tcp: attempt=%s connect error: %s", attempts, exc)
+                time.sleep(0.15)
+        if sock is None:
+            self._set_bridge_stage(
+                "tcp_connect_failed",
+                f"port={port} attempts={attempts} eof_stubs={eof_stubs} last_err={last_err}",
+            )
+            logger.warning("TCP connect to scrcpy-server failed: %s", last_err)
+            server_proc.terminate()
+            self._remove_forward(adb, address, port)
             self._abort_start(epoch)
             return
 
-        try:
-            ffmpeg_proc = subprocess.Popen(
-                ffmpeg_cmd,
-                stdin=tail_proc.stdout,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-        except OSError as exc:
-            logger.warning("Failed to start ffmpeg: %s", exc)
-            with self._lock:
-                self._tail_proc = tail_proc
-            self._abort_start(epoch)
-            return
-
-        # Allow tail to receive SIGPIPE if ffmpeg exits.
-        if tail_proc.stdout is not None:
-            tail_proc.stdout.close()
-
-        _spawn_stderr_logger(ffmpeg_proc, "ffmpeg")
-
+        sock.settimeout(None)
+        broadcast = H264Broadcast()
         with self._lock:
             if epoch != self._connect_epoch:
-                self._kill_procs(scrcpy_pid, tail_proc, ffmpeg_proc)
+                sock.close()
+                server_proc.terminate()
+                self._remove_forward(adb, address, port)
                 return
-            self._tail_proc = tail_proc
-            self._ffmpeg_proc = ffmpeg_proc
+            self._server_proc = server_proc
+            self._tcp_sock = sock
+            self._forward_port = port
+            self._broadcast = broadcast
+            self._pipeline_wall_t0 = pipeline_wall_t0
+            self._first_nal_wall = None
+            self._last_nal_wall = None
+            self._nal_count = 0
+            self._bytes_out = 0
+            self._bytes_read_tcp = len(primed)
 
-        time.sleep(0.35)
-        if self._is_stale(epoch):
-            self._abort_start(epoch)
-            return
-        if not self._pid_alive(scrcpy_pid):
-            logger.warning("scrcpy exited early (pid=%s); see %s", scrcpy_pid, log_path)
-            self._spill_scrcpy_log(log_path)
-            self._abort_start(epoch)
-            return
-
-        if ffmpeg_proc.poll() is not None:
-            logger.warning("ffmpeg exited early (rc=%s); see ffmpeg stderr logs above", ffmpeg_proc.returncode)
-            self._abort_start(epoch)
-            return
-
-        broadcast = Fmp4Broadcast()
-        pump = threading.Thread(
-            target=self._pump_ffmpeg_stdout,
-            args=(ffmpeg_proc, broadcast),
-            name="device-mirror-pump",
+        self._set_bridge_stage("tcp_read", f"reader starting primed={len(primed)}")
+        reader = threading.Thread(
+            target=self._read_h264_loop,
+            args=(epoch, sock, broadcast, pipeline_wall_t0, primed),
+            name="device-mirror-h264",
             daemon=True,
         )
-        pump.start()
-
+        reader.start()
         with self._lock:
-            if epoch != self._connect_epoch:
-                broadcast.close()
-                self._kill_procs(scrcpy_pid, tail_proc, ffmpeg_proc)
-                return
-            self._broadcast = broadcast
-            self._pump_thread = pump
+            self._reader_thread = reader
 
-        # Mark connected as soon as the pipeline is running. Waiting for ffmpeg
-        # media fragments here previously aborted (and killed scrcpy) while
-        # Metal/server init was still in progress — clients attach to /stream
-        # and receive fMP4 naturally as the pump produces it.
-        if not is_pipeline_ready_for_stream(
-            scrcpy_alive=self._pid_alive(scrcpy_pid),
-            ffmpeg_alive=ffmpeg_proc.poll() is None,
-        ):
-            logger.warning(
-                "Pipeline not ready after pump start (scrcpy pid=%s alive=%s ffmpeg rc=%s)",
-                scrcpy_pid,
-                self._pid_alive(scrcpy_pid),
-                ffmpeg_proc.poll(),
+        # Wait briefly for first NAL before marking connected.
+        ready_deadline = time.time() + 10.0
+        while time.time() < ready_deadline:
+            if self._is_stale(epoch):
+                self._abort_start(epoch)
+                return
+            with self._lock:
+                first = self._first_nal_wall
+            if first is not None:
+                break
+            if server_proc.poll() is not None:
+                self._abort_start(epoch)
+                return
+            time.sleep(0.05)
+        else:
+            with self._lock:
+                bytes_read = self._bytes_read_tcp
+            self._set_bridge_stage(
+                "first_nal_timeout",
+                f"port={port} bytes_read_tcp={bytes_read} (no Annex-B NAL in 10s)",
             )
-            self._spill_scrcpy_log(log_path)
+            logger.warning(
+                "No H.264 NAL received within timeout (bytes_read_tcp=%s)",
+                bytes_read,
+            )
             self._abort_start(epoch)
             return
 
@@ -826,205 +754,342 @@ class DeviceMirrorSession:
             self._abort_start(epoch)
             return
 
+        with self._lock:
+            bytes_read = self._bytes_read_tcp
+            nal_count = self._nal_count
+        self._set_bridge_stage(
+            "streaming",
+            f"port={port} bytes_read_tcp={bytes_read} nals={nal_count}",
+        )
         self._set_state("connected", device_address=address, message=None)
-        watcher = threading.Thread(target=self._watch_procs, name="device-mirror-watch", daemon=True)
-        self._watcher_thread = watcher
-        watcher.start()
+        threading.Thread(
+            target=self._keep_device_awake,
+            args=(epoch, adb, address),
+            name="device-mirror-awake",
+            daemon=True,
+        ).start()
+        threading.Thread(
+            target=self._watch_server,
+            args=(epoch,),
+            name="device-mirror-watch",
+            daemon=True,
+        ).start()
+        logger.info(
+            "pipeline.connected: h264 ws port=%s first_nal=%.3fs",
+            port,
+            (self._first_nal_wall or pipeline_wall_t0) - pipeline_wall_t0,
+        )
 
-    def _abort_start(self, epoch: int | None = None) -> None:
-        """Kill any started procs, then remove the temp dir once the pipeline has stopped."""
-        self._teardown_procs()
-        if epoch is not None and self._is_stale(epoch):
-            return
-        self.set_error("connect_failed")
-    @staticmethod
-    def _wait_for_scrcpy_pid(
-        pid_path: str,
-        timeout_s: float,
-        should_abort: Callable[[], bool] | None = None,
-    ) -> int | None:
-        deadline = time.monotonic() + timeout_s
-        while time.monotonic() < deadline:
-            if should_abort and should_abort():
-                return None
-            try:
-                with open(pid_path, encoding="utf-8") as fh:
-                    raw = fh.read().strip()
-                if raw:
-                    pid = int(raw)
-                    if DeviceMirrorSession._pid_alive(pid):
-                        return pid
-            except (OSError, ValueError):
-                pass
-            time.sleep(0.1)
-        return None
-
-    @staticmethod
-    def _wait_for_record_bytes(
-        record_path: str,
-        scrcpy_pid: int,
-        *,
-        timeout_s: float,
-        min_bytes: int,
-        should_abort: Callable[[], bool] | None = None,
-    ) -> bool:
-        """Wait until scrcpy has created and written at least ``min_bytes``."""
-        deadline = time.monotonic() + timeout_s
-        while time.monotonic() < deadline:
-            if should_abort and should_abort():
-                return False
-            if not DeviceMirrorSession._pid_alive(scrcpy_pid):
-                return False
-            try:
-                if os.path.exists(record_path) and os.path.getsize(record_path) >= min_bytes:
-                    return True
-            except OSError:
-                pass
-            time.sleep(0.1)
-        try:
-            return os.path.exists(record_path) and os.path.getsize(record_path) >= min_bytes
-        except OSError:
-            return False
-
-    @staticmethod
-    def _wait_for_init_segment(broadcast: Fmp4Broadcast, timeout_s: float) -> bool:
-        deadline = time.monotonic() + timeout_s
-        while time.monotonic() < deadline:
-            if broadcast.init_segment:
-                return True
-            time.sleep(0.05)
-        return broadcast.init_segment is not None
-
-    @staticmethod
-    def _pump_ffmpeg_stdout(
-        ffmpeg_proc: subprocess.Popen[bytes],
-        broadcast: Fmp4Broadcast,
+    def _read_h264_loop(
+        self,
+        epoch: int,
+        sock: socket.socket,
+        broadcast: H264Broadcast,
+        pipeline_wall_t0: float,
+        primed: bytes = b"",
     ) -> None:
-        stdout = ffmpeg_proc.stdout
-        if stdout is None:
-            broadcast.close()
-            return
+        buf = primed
+        total_read = len(primed)
+        first_chunk_logged = False
         try:
-            while True:
-                chunk = stdout.read(65536)
-                if not chunk:
+            if primed:
+                logger.info(
+                    "bridge.tcp_read: primed=%s bytes first_hex=%s",
+                    len(primed),
+                    primed[:16].hex(),
+                )
+            # Process any bytes already read during the live-connect probe.
+            if buf:
+                units, buf = annex_b_split_nals(buf, return_remainder=True)
+                now = time.time()
+                wall_ms = int(now * 1000)
+                for unit in units:
+                    msg = build_ws_nal_message(
+                        unit.data,
+                        nal_type=unit.nal_type,
+                        wall_ms=wall_ms,
+                        is_key=is_key_nal(unit.nal_type),
+                    )
+                    broadcast.feed(msg, nal_type=unit.nal_type)
+                    with self._lock:
+                        if self._first_nal_wall is None:
+                            self._first_nal_wall = now
+                            self._bridge_stage = "first_nal"
+                            self._bridge_detail = (
+                                f"after={now - pipeline_wall_t0:.3f}s type={unit.nal_type} "
+                                f"bytes_read_tcp={total_read}"
+                            )
+                            logger.info(
+                                "bridge.stage: first_nal — %s",
+                                self._bridge_detail,
+                            )
+                            logger.info(
+                                "pipeline.latency: first_nal after=%.3fs type=%s",
+                                now - pipeline_wall_t0,
+                                unit.nal_type,
+                            )
+                        self._last_nal_wall = now
+                        self._nal_count += 1
+                        self._bytes_out += len(msg)
+            while not self._is_stale(epoch):
+                try:
+                    chunk = sock.recv(65536)
+                except OSError as exc:
+                    self._set_bridge_stage(
+                        "tcp_read_error",
+                        f"recv OSError: {exc} bytes_read_tcp={total_read}",
+                    )
+                    logger.warning(
+                        "bridge.tcp_read: OSError after %s bytes: %s", total_read, exc
+                    )
                     break
-                broadcast.feed(chunk)
+                if not chunk:
+                    self._set_bridge_stage(
+                        "tcp_eof",
+                        f"bytes_read_tcp={total_read} nals={self._nal_count}",
+                    )
+                    logger.warning(
+                        "bridge.tcp_read: EOF after bytes_read_tcp=%s nals=%s",
+                        total_read,
+                        self._nal_count,
+                    )
+                    break
+                total_read += len(chunk)
+                with self._lock:
+                    self._bytes_read_tcp = total_read
+                if not first_chunk_logged:
+                    first_chunk_logged = True
+                    logger.info(
+                        "bridge.tcp_read: first_live_chunk=%s bytes hex=%s total=%s",
+                        len(chunk),
+                        chunk[:16].hex(),
+                        total_read,
+                    )
+                elif total_read < 65536 or total_read % (512 * 1024) < len(chunk):
+                    logger.info(
+                        "bridge.tcp_read: +%s bytes total=%s nals=%s",
+                        len(chunk),
+                        total_read,
+                        self._nal_count,
+                    )
+                buf += chunk
+                units, buf = annex_b_split_nals(buf, return_remainder=True)
+                now = time.time()
+                wall_ms = int(now * 1000)
+                for unit in units:
+                    msg = build_ws_nal_message(
+                        unit.data,
+                        nal_type=unit.nal_type,
+                        wall_ms=wall_ms,
+                        is_key=is_key_nal(unit.nal_type),
+                    )
+                    broadcast.feed(msg, nal_type=unit.nal_type)
+                    with self._lock:
+                        if self._first_nal_wall is None:
+                            self._first_nal_wall = now
+                            self._bridge_stage = "first_nal"
+                            self._bridge_detail = (
+                                f"after={now - pipeline_wall_t0:.3f}s type={unit.nal_type} "
+                                f"bytes_read_tcp={total_read}"
+                            )
+                            logger.info(
+                                "bridge.stage: first_nal — %s",
+                                self._bridge_detail,
+                            )
+                            logger.info(
+                                "pipeline.latency: first_nal after=%.3fs type=%s",
+                                now - pipeline_wall_t0,
+                                unit.nal_type,
+                            )
+                        self._last_nal_wall = now
+                        self._nal_count += 1
+                        self._bytes_out += len(msg)
         except Exception:
-            logger.exception("Failed pumping ffmpeg stdout into fMP4 broadcast")
+            self._set_bridge_stage("tcp_read_failed", f"bytes_read_tcp={total_read}")
+            logger.exception("H.264 reader failed")
         finally:
             broadcast.close()
+            logger.info(
+                "pipeline.h264: reader ended (nals=%s bytes_read_tcp=%s)",
+                self._nal_count,
+                total_read,
+            )
 
-    def _watch_procs(self) -> None:
-        while not self._stopping:
-            scrcpy_pid = self._scrcpy_pid
-            ffmpeg = self._ffmpeg_proc
-            if scrcpy_pid is None or ffmpeg is None:
-                return
-            if not self._pid_alive(scrcpy_pid) or ffmpeg.poll() is not None:
+    def _keep_device_awake(self, epoch: int, adb: str, serial: str) -> None:
+        while not self._is_stale(epoch):
+            wake_device_screen(adb, serial)
+            for _ in range(20):
+                if self._is_stale(epoch):
+                    return
+                time.sleep(1.0)
+
+    def _watch_server(self, epoch: int) -> None:
+        while not self._is_stale(epoch):
+            with self._lock:
+                proc = self._server_proc
+                broadcast = self._broadcast
+            if proc is not None and proc.poll() is not None:
                 if not self._stopping:
-                    logger.warning(
-                        "Mirror pipeline process exited (scrcpy pid=%s alive=%s ffmpeg rc=%s)",
-                        scrcpy_pid,
-                        self._pid_alive(scrcpy_pid),
-                        ffmpeg.poll(),
-                    )
+                    logger.warning("scrcpy-server exited; ending session")
+                    self._teardown_procs()
+                    self.set_error("connection_lost")
+                return
+            if broadcast is not None and broadcast.closed:
+                if not self._stopping:
                     self._teardown_procs()
                     self.set_error("connection_lost")
                 return
             time.sleep(0.5)
 
-    def iter_stream(self) -> Iterator[bytes]:
-        with self._lock:
-            if self._state != "connected" or self._stopping:
-                return
-            broadcast = self._broadcast
-        if broadcast is None:
+    def _abort_start(self, epoch: int | None = None) -> None:
+        self._teardown_procs()
+        if epoch is not None and self._is_stale(epoch):
             return
-        yield from broadcast.subscribe()
+        self.set_error("connect_failed")
+
+    def open_h264_subscription(self) -> H264Subscription | None:
+        """Register on the live broadcast immediately (call from WS accept path)."""
+        with self._lock:
+            state = self._state
+            stopping = self._stopping
+            broadcast = self._broadcast
+        if stopping or state != "connected":
+            logger.info(
+                "open_h264_subscription: None (state=%s stopping=%s session id=%s)",
+                state,
+                stopping,
+                id(self),
+            )
+            return None
+        if broadcast is None:
+            logger.info(
+                "open_h264_subscription: None (broadcast is None session id=%s)",
+                id(self),
+            )
+            return None
+        if broadcast.closed:
+            logger.info(
+                "open_h264_subscription: None (broadcast closed id=%s session id=%s)",
+                id(broadcast),
+                id(self),
+            )
+            return None
+        sub = broadcast.open_subscription()
+        # If pipeline swapped broadcast under us, drop the orphan subscription.
+        with self._lock:
+            still_current = self._broadcast is broadcast and self._state == "connected"
+        if sub is not None and not still_current:
+            logger.warning(
+                "open_h264_subscription: broadcast swapped after subscribe — dropping "
+                "orphan sub broadcast id=%s session id=%s",
+                id(broadcast),
+                id(self),
+            )
+            sub.close()
+            return None
+        logger.info(
+            "open_h264_subscription: returned %s broadcast id=%s session id=%s "
+            "subscribers=%s",
+            "H264Subscription" if sub is not None else None,
+            id(broadcast),
+            id(self),
+            broadcast.stats.get("subscribers"),
+        )
+        return sub
+
+    def iter_h264(self) -> Iterator[bytes]:
+        """Yield framed H.264 WS messages while the pipeline is live."""
+        while self._pipeline_streaming():
+            sub = self.open_h264_subscription()
+            if sub is None:
+                time.sleep(0.05)
+                continue
+            try:
+                for msg in sub:
+                    yield msg
+                    if not self._pipeline_streaming():
+                        return
+            finally:
+                sub.close()
+            if not self._pipeline_streaming():
+                return
+            time.sleep(0.05)
+
+    def _pipeline_streaming(self) -> bool:
+        with self._lock:
+            if self._stopping or self._state != "connected":
+                return False
+            proc = self._server_proc
+            broadcast = self._broadcast
+        if proc is None or proc.poll() is not None:
+            return False
+        if broadcast is None or broadcast.closed:
+            return False
+        return True
 
     def disconnect(self) -> None:
         with self._lock:
             self._connect_epoch += 1
             self._stopping = True
-        # Do not `adb disconnect` — we reuse whatever device was already paired.
         self._teardown_procs()
         self.reset_to_idle()
         self._stopping = False
 
+    def refresh_stream(self) -> bool:
+        """Restart capture (e.g. after rotation)."""
+        with self._lock:
+            if self._stopping or self._state != "connected":
+                return False
+            tools = dict(self._tools) if self._tools else None
+            address = self._device_address
+            self._connect_epoch += 1
+            epoch = self._connect_epoch
+        if not tools or not address:
+            return False
+        self._teardown_procs()
+        with self._lock:
+            if epoch != self._connect_epoch or self._stopping:
+                return False
+            self._tools = tools
+            self._device_address = address
+            self._state = "connecting"
+            self._message = STATUS_MESSAGES["connecting"]
+            self._error = None
+        try:
+            self._start_pipeline(epoch)
+        except Exception:
+            logger.exception("refresh-stream failed")
+            return False
+        return self.get_status()["state"] == "connected"
+
     def _teardown_procs(self) -> None:
         with self._lock:
-            scrcpy_pid = self._scrcpy_pid
-            tail = self._tail_proc
-            ffmpeg = self._ffmpeg_proc
+            sock = self._tcp_sock
+            proc = self._server_proc
             broadcast = self._broadcast
-            record_path = self._record_path
-            record_dir = self._record_dir
-            self._scrcpy_pid = None
-            self._tail_proc = None
-            self._ffmpeg_proc = None
+            port = self._forward_port
+            tools = self._tools
+            address = self._device_address
+            self._tcp_sock = None
+            self._server_proc = None
             self._broadcast = None
-            self._pump_thread = None
-            self._record_path = None
-            self._record_dir = None
+            self._reader_thread = None
+            self._forward_port = None
+            self._pipeline_wall_t0 = None
+            self._first_nal_wall = None
+            self._last_nal_wall = None
         if broadcast is not None:
             broadcast.close()
-        self._kill_procs(scrcpy_pid, tail, ffmpeg)
-        self._cleanup_record(record_path, record_dir)
-
-    @staticmethod
-    def _cleanup_record(record_path: str | None, record_dir: str | None) -> None:
-        if record_path:
+        if sock is not None:
             try:
-                os.unlink(record_path)
+                sock.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
-        if record_dir:
-            shutil.rmtree(record_dir, ignore_errors=True)
-
-    @staticmethod
-    def _spill_scrcpy_log(log_path: str) -> None:
-        try:
-            with open(log_path, encoding="utf-8", errors="replace") as fh:
-                for line in fh:
-                    line = line.rstrip()
-                    if line:
-                        logger.info("scrcpy: %s", line)
-        except OSError:
-            pass
-
-    @staticmethod
-    def _pid_alive(pid: int) -> bool:
-        try:
-            os.kill(pid, 0)
-            return True
-        except OSError:
-            return False
-
-    @staticmethod
-    def _kill_scrcpy_pid(pid: int | None) -> None:
-        if pid is None:
-            return
-        try:
-            if DeviceMirrorSession._pid_alive(pid):
-                os.kill(pid, signal.SIGTERM)
-                deadline = time.monotonic() + 2.0
-                while time.monotonic() < deadline and DeviceMirrorSession._pid_alive(pid):
-                    time.sleep(0.05)
-                if DeviceMirrorSession._pid_alive(pid):
-                    os.kill(pid, signal.SIGKILL)
-        except OSError:
-            pass
-
-    @staticmethod
-    def _kill_procs(
-        scrcpy_pid: int | None,
-        tail: subprocess.Popen[bytes] | None,
-        ffmpeg: subprocess.Popen[bytes] | None,
-    ) -> None:
-        for proc in (ffmpeg, tail):
-            if proc is None:
-                continue
+            try:
+                sock.close()
+            except OSError:
+                pass
+        if proc is not None:
             try:
                 if proc.poll() is None:
                     proc.terminate()
@@ -1034,4 +1099,30 @@ class DeviceMirrorSession:
                         proc.kill()
             except OSError:
                 pass
-        DeviceMirrorSession._kill_scrcpy_pid(scrcpy_pid)
+        # Kill any leftover server on device for this session
+        if tools and address:
+            try:
+                subprocess.run(
+                    [tools["adb"], "-s", address, "shell", "pkill", "-f", "scrcpy.Server"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            if port is not None:
+                self._remove_forward(tools["adb"], address, port)
+
+    @staticmethod
+    def _remove_forward(adb: str, serial: str, port: int) -> None:
+        try:
+            subprocess.run(
+                [adb, "-s", serial, "forward", "--remove", f"tcp:{port}"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass

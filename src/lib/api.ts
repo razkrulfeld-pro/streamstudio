@@ -95,10 +95,18 @@ export function disconnectDevice(): Promise<{ ok: boolean }> {
   return request<{ ok: boolean }>('/api/device/disconnect', { method: 'POST' })
 }
 
+/** Restart scrcpy-server capture after rotation. */
+export function refreshDeviceStream(): Promise<{ ok: boolean }> {
+  return request<{ ok: boolean }>('/api/device/refresh-stream', { method: 'POST' })
+}
+
+/** @deprecated fMP4 HTTP stream removed — use device WebSocket. */
 export function deviceStreamUrl(): string {
-  // Prefer same-origin via the Vite /api proxy so <video> + captureStream
-  // stay first-party. Fall back to absolute API host when configured.
   const configured = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.trim()
   if (configured) return `${configured.replace(/\/$/, '')}/api/device/stream`
   return '/api/device/stream'
+}
+
+export function deviceLatency(): Promise<Record<string, unknown>> {
+  return request<Record<string, unknown>>('/api/device/latency')
 }

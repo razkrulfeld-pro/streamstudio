@@ -1,11 +1,17 @@
 import {
   connectDevice,
-  deviceStreamUrl,
   disconnectDevice,
   getDeviceStatus,
+  refreshDeviceStream,
   type DeviceMirrorState,
 } from '@/lib/api'
 import { createDeviceConnectGuard } from '@/lib/device-connect-guard'
+import {
+  attachDeviceH264WebSocket,
+  type DeviceH264AttachResult,
+} from '@/lib/device-h264-ws'
+import { watchDeviceVideoDimensions } from '@/lib/device-stream-live'
+import { sleep } from '@/lib/device-stream-retry'
 import { useAssetLibrary } from '@/context/asset-library-context'
 import { useRecordings } from '@/context/recordings-context'
 import { useSettings } from '@/context/settings-context'
@@ -71,13 +77,12 @@ export function useRecordingSession(options?: {
 
   const outputWidth = session?.contentType.canvasWidth ?? 1920
   const outputHeight = session?.contentType.canvasHeight ?? 1080
-  const outputDimensions = useMemo(
+  const sessionOutputDimensions = useMemo(
     () => ({ width: outputWidth, height: outputHeight }),
     [outputWidth, outputHeight],
   )
   const maxDurationSeconds = session?.youtubeMetadata.maxDurationSeconds ?? null
-  const outputDimensionsRef = useRef(outputDimensions)
-  outputDimensionsRef.current = outputDimensions
+  const outputDimensionsRef = useRef(sessionOutputDimensions)
   const sessionRef = useRef(session)
   sessionRef.current = session
 
@@ -141,6 +146,17 @@ export function useRecordingSession(options?: {
   const screenSourceRef = useRef<'none' | 'display' | 'device'>('none')
   const devicePollRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const deviceConnectGuardRef = useRef(createDeviceConnectGuard())
+  const deviceLiveCleanupRef = useRef<(() => void) | null>(null)
+  const deviceH264Ref = useRef<DeviceH264AttachResult | null>(null)
+  const deviceStreamAbortRef = useRef<AbortController | null>(null)
+  const deviceAttachInFlightRef = useRef(false)
+  const deviceRotationRefreshRef = useRef(false)
+
+  // Recording canvas stays fixed to the session aspect (16:9 / 9:16 / …).
+  // Phone mirror letterboxes inside the screen layer — never resizes the stage.
+  useEffect(() => {
+    outputDimensionsRef.current = sessionOutputDimensions
+  }, [sessionOutputDimensions])
 
   const setCameraLayout = useCallback((patch: Partial<CameraLayoutSettings>) => {
     setCameraLayoutState((current) => {
@@ -613,14 +629,24 @@ export function useRecordingSession(options?: {
     }
   }, [])
 
+  const stopDeviceLiveHelpers = useCallback(() => {
+    deviceLiveCleanupRef.current?.()
+    deviceLiveCleanupRef.current = null
+    deviceStreamAbortRef.current?.abort()
+    deviceStreamAbortRef.current = null
+    deviceH264Ref.current?.stop()
+    deviceH264Ref.current = null
+  }, [])
+
   useEffect(() => {
     return () => {
       clearDevicePoll()
+      stopDeviceLiveHelpers()
       if (screenSourceRef.current === 'device') {
         void disconnectDevice().catch(() => undefined)
       }
     }
-  }, [clearDevicePoll])
+  }, [clearDevicePoll, stopDeviceLiveHelpers])
 
   const clearScreenVideoElement = useCallback(() => {
     const video = screenVideoRef.current
@@ -632,7 +658,9 @@ export function useRecordingSession(options?: {
 
   const stopDeviceMirror = useCallback(async () => {
     clearDevicePoll()
+    stopDeviceLiveHelpers()
     deviceConnectGuardRef.current.release()
+    deviceRotationRefreshRef.current = false
     try {
       await disconnectDevice()
     } catch {
@@ -649,45 +677,119 @@ export function useRecordingSession(options?: {
     setDeviceState('idle')
     setDeviceMessage(null)
     setDeviceError(null)
-  }, [clearDevicePoll, clearScreenVideoElement])
+  }, [clearDevicePoll, clearScreenVideoElement, stopDeviceLiveHelpers])
+
+  const bindDeviceVideoElement = useCallback(
+    async (video: HTMLVideoElement, _url?: string) => {
+      // Raw H.264 over WebSocket → WebCodecs → canvas.captureStream().
+      // No progressive fMP4 (that caused session-length latency).
+      deviceStreamAbortRef.current?.abort()
+      deviceH264Ref.current?.stop()
+      const abort = new AbortController()
+      deviceStreamAbortRef.current = abort
+
+      const attached = await attachDeviceH264WebSocket(video, {
+        signal: abort.signal,
+        onLatency: (sample) => {
+          console.info('[device-h264] latency', {
+            captureLagMs: Math.round(sample.captureLagMs),
+            framesDecoded: sample.framesDecoded,
+            wallMs: Math.round(sample.wallMs),
+          })
+        },
+      })
+      deviceH264Ref.current = attached
+
+      screenStreamRef.current = attached.stream
+      screenSourceRef.current = 'device'
+      setScreenAudioAvailable(false)
+      setScreenAudioCaptureEnabled(false)
+      setScreenShareEnabled(true)
+    },
+    [],
+  )
 
   const attachDeviceStream = useCallback(async () => {
     const video = screenVideoRef.current
     if (!video) return
+    if (deviceAttachInFlightRef.current) {
+      console.info('[device-h264] attach skipped — already in flight')
+      return
+    }
+    deviceAttachInFlightRef.current = true
 
-    video.srcObject = null
-    video.crossOrigin = 'anonymous'
-    video.preload = 'auto'
-    video.src = deviceStreamUrl()
+    stopDeviceLiveHelpers()
 
-    await new Promise<void>((resolve) => {
-      const done = () => {
-        video.removeEventListener('loadeddata', done)
-        video.removeEventListener('error', done)
-        resolve()
+    try {
+      await bindDeviceVideoElement(video)
+    } catch (err) {
+      console.warn('[device-h264] attach failed', err)
+      stopMediaStream(screenStreamRef.current)
+      screenStreamRef.current = null
+      screenSourceRef.current = 'none'
+      setScreenShareEnabled(false)
+      setScreenAudioAvailable(false)
+      setDeviceState('error')
+      setDeviceError('Connection lost. Retry to reconnect.')
+      return
+    } finally {
+      deviceAttachInFlightRef.current = false
+    }
+
+    const installDeviceLiveHelpers = (el: HTMLVideoElement) => {
+      // Only replace dimension watchers — never abort the H.264 WebSocket we just attached.
+      deviceLiveCleanupRef.current?.()
+      deviceLiveCleanupRef.current = null
+      const requestRotationRefresh = (
+        next: { width: number; height: number } | null,
+        prev: { width: number; height: number } | null,
+        reason: string,
+      ) => {
+        if (deviceRotationRefreshRef.current) return
+        if (screenSourceRef.current !== 'device') return
+        deviceRotationRefreshRef.current = true
+        void (async () => {
+          try {
+            console.info('[device-h264] rotation refresh', {
+              from: prev,
+              to: next,
+              reason,
+              wallMs: Math.round(performance.now()),
+            })
+            stopDeviceLiveHelpers()
+            await refreshDeviceStream()
+            for (let i = 0; i < 60; i++) {
+              const status = await getDeviceStatus()
+              if (status.state === 'connected') break
+              if (status.state === 'error' || status.state === 'idle') {
+                throw new Error(status.error || 'Device disconnected during rotation refresh')
+              }
+              await sleep(250)
+            }
+            await sleep(400)
+            await bindDeviceVideoElement(el)
+            installDeviceLiveHelpers(el)
+          } catch (refreshErr) {
+            console.warn('[device-h264] rotation refresh failed', refreshErr)
+            setDeviceState('error')
+            setDeviceError('Connection lost. Retry to reconnect.')
+            setScreenShareEnabled(false)
+          } finally {
+            deviceRotationRefreshRef.current = false
+          }
+        })()
       }
-      if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
-        resolve()
-        return
+
+      const stopDimWatch = watchDeviceVideoDimensions(el, (next, prev) => {
+        requestRotationRefresh(next, prev, 'dimensions')
+      })
+      deviceLiveCleanupRef.current = () => {
+        stopDimWatch()
       }
-      video.addEventListener('loadeddata', done)
-      video.addEventListener('error', done)
-    })
+    }
 
-    await video.play().catch(() => undefined)
-
-    const media = video as HTMLVideoElement & { captureStream(): MediaStream }
-    const captured = media.captureStream()
-    screenStreamRef.current = captured
-    screenSourceRef.current = 'device'
-    const hasAudio = captured.getAudioTracks().length > 0
-    setScreenAudioAvailable(hasAudio)
-    captured.getAudioTracks().forEach((track: MediaStreamTrack) => {
-      track.enabled = screenAudioEnabledRef.current
-    })
-    setScreenAudioCaptureEnabled(screenAudioEnabledRef.current)
-    setScreenShareEnabled(true)
-  }, [])
+    installDeviceLiveHelpers(video)
+  }, [bindDeviceVideoElement, stopDeviceLiveHelpers])
 
   const startDeviceMirror = useCallback(async () => {
     // Sync guard — React state updates are too slow to prevent double-clicks.
@@ -716,7 +818,7 @@ export function useRecordingSession(options?: {
       return
     }
 
-    let attachStarted = false
+    const attachStartedRef = { current: false }
     devicePollRef.current = setInterval(() => {
       void (async () => {
         try {
@@ -728,8 +830,8 @@ export function useRecordingSession(options?: {
           if (status.state === 'connected') {
             clearDevicePoll()
             deviceConnectGuardRef.current.release()
-            if (attachStarted) return
-            attachStarted = true
+            if (attachStartedRef.current) return
+            attachStartedRef.current = true
             await attachDeviceStream()
           } else if (status.state === 'error' || status.state === 'idle') {
             clearDevicePoll()

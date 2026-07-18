@@ -125,18 +125,6 @@ function isDrawableSource(source: CanvasImageSource | null | undefined): source 
   return true
 }
 
-function sourceAspect(source: CanvasImageSource): number | undefined {
-  if (typeof VideoFrame !== 'undefined' && source instanceof VideoFrame) {
-    const w = source.displayWidth || source.codedWidth
-    const h = source.displayHeight || source.codedHeight
-    return w > 0 && h > 0 ? w / h : undefined
-  }
-  if (source instanceof HTMLVideoElement && source.videoWidth > 0 && source.videoHeight > 0) {
-    return source.videoWidth / source.videoHeight
-  }
-  return undefined
-}
-
 export function renderRecordingFrame({
   context,
   width,
@@ -199,7 +187,9 @@ export function renderRecordingFrame({
     )
     drawScreenBackground(context, stage)
 
-    const frameRect = computeScreenShareFrameRect(width, height, layout.margins, sourceAspect(screen))
+    // Frame stays locked to the stage aspect. Phone/screen content letterboxes
+    // inside via drawScreenShareInFrame — never resize the recording frame on rotation.
+    const frameRect = computeScreenShareFrameRect(width, height, layout.margins, width / height)
     drawScreenShareInFrame(context, screen, frameRect, layout.cornerRadius)
   }
 
